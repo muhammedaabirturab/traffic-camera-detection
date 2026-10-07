@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+*.egg-info/
+
+# Runtime data: uploads, evidence images, processed videos, history DB
+data/
+
+# Datasets and training runs (never commit datasets)
+datasets/*
+!datasets/README.md
+runs/
+
+# Model weights (download or train — see models/README.md)
+models/*.pt
+models/*.weights
+models/*.onnx
+models/*.engine
+models/*_openvino_model/
+# keep cfg/names and metrics so trained results can be shared if desired
+!models/README.md
+
+# Frontend
+frontend/node_modules/
+# frontend/dist is committed on purpose so `python run.py` serves the dashboard without Node.js
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

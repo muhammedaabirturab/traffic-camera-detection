@@ -1,0 +1,157 @@
+{
+  "version": "1.0.0",
+  "jurisdiction": "India (central law). States may notify additional rules and compounding amounts.",
+  "last_reviewed": "2026-10-07",
+  "disclaimer": "Educational project. Detections are AI-generated possible violations based on available visual evidence and require human verification. Legal references and penalty notes are informational, may be outdated, and are not legal advice.",
+  "status_legend": {
+    "active": "Detected automatically from images and video",
+    "video_only": "Detected only from video, because it needs temporal information and scene configuration",
+    "not_implemented": "Listed for completeness; cannot be reliably inferred from the available data/models"
+  },
+  "rules": [
+    {
+      "violation_id": "NO_HELMET",
+      "violation_name": "Rider Without Helmet",
+      "short_label": "Possible No-Helmet Violation",
+      "description": "A person driving, riding or being carried on a motorcycle appears not to be wearing protective headgear.",
+      "applicable_vehicle_type": ["motorcycle", "scooter"],
+      "detection_logic": "YOLO detects motorcycle and person; a person is treated as a rider only if their box is horizontally aligned with, vertically seated on, and overlapping the two-wheeler (association score >= threshold). The top ~30% of the rider box is the head region. If no helmet box from the helmet model lies in that region (or a bare-head class is detected there), a possible violation is raised. Riders that are too small, cut off by the frame, or evaluated without a helmet model produce 'insufficient visual evidence' instead.",
+      "required_models": ["vehicle", "helmet"],
+      "input_types": ["image", "video"],
+      "status": "active",
+      "enabled": true,
+      "min_confidence": 0.45,
+      "legal_reference": {
+        "act": "Motor Vehicles Act, 1988",
+        "section": "Section 129",
+        "title": "Wearing of protective headgear",
+        "penalty_section": "Section 194D",
+        "penalty_title": "Penalty for not wearing protective headgear",
+        "notes": "Section 129 (as substituted by the Motor Vehicles (Amendment) Act, 2019) applies to every person above four years of age driving, riding or being carried on a motorcycle in a public place. It contains a proviso for a person who is a Sikh wearing a turban; the system cannot determine this and a human reviewer must.",
+        "source_url": "https://lawx.in/acts/section/46/465/4417",
+        "verification": "Section text checked against an online bare-act copy (lawx.in, 2026-10-07). Confirm against the official India Code before relying on it."
+      },
+      "penalty_note": "Section 194D, as inserted in 2019, provides for a fine and temporary disqualification from holding a licence. Amounts and enforcement practice can change and differ by state — check the current official notification. Not shown as a definitive fine by this system."
+    },
+    {
+      "violation_id": "TRIPLE_RIDING",
+      "violation_name": "More Than Two Persons on a Two-Wheeler",
+      "short_label": "Possible Multiple-Riding Violation",
+      "description": "More than one person in addition to the driver appears to be riding on a two-wheeled motorcycle.",
+      "applicable_vehicle_type": ["motorcycle", "scooter"],
+      "detection_logic": "Counts persons whose association score with the same motorcycle exceeds the 'strong' threshold. A possible violation is raised only if more than the permitted number (driver + 1) are strongly associated. People merely standing near the vehicle fail the vertical-seating and horizontal-alignment checks. Borderline cases are reported as 'insufficient visual evidence'.",
+      "required_models": ["vehicle"],
+      "input_types": ["image", "video"],
+      "status": "active",
+      "enabled": true,
+      "min_confidence": 0.5,
+      "legal_reference": {
+        "act": "Motor Vehicles Act, 1988",
+        "section": "Section 128(1)",
+        "title": "Safety measures for drivers and pillion riders",
+        "penalty_section": "Section 194C",
+        "penalty_title": "Penalty for violation of safety measures for motor cycle drivers and pillion riders",
+        "notes": "Section 128(1): no driver of a two-wheeled motor cycle shall carry more than one person in addition to himself, seated on a proper seat behind the driver.",
+        "source_url": "https://lawx.in/acts/section/46/465/4416",
+        "verification": "Section text checked against an online bare-act copy (lawx.in, 2026-10-07). Confirm against the official India Code before relying on it."
+      },
+      "penalty_note": "Section 194C, as inserted in 2019, provides for a fine and temporary licence disqualification. Amounts may be revised — consult the current official notification."
+    },
+    {
+      "violation_id": "RED_LIGHT_JUMP",
+      "violation_name": "Crossing Stop Line on Red Signal",
+      "short_label": "Possible Red-Light Violation",
+      "description": "A tracked vehicle appears to cross the stop line while the traffic signal facing it is red.",
+      "applicable_vehicle_type": ["motorcycle", "car", "bus", "truck", "bicycle"],
+      "detection_logic": "Video only. Requires (1) a stop line position supplied by the operator for that camera, (2) a traffic light visible in frame whose colour is estimated from HSV pixel analysis and smoothed over several frames, and (3) a vehicle tracked (ByteTrack) from one side of the line to the other. Never evaluated on single images, and not evaluated while the signal state is unknown.",
+      "required_models": ["vehicle"],
+      "input_types": ["video"],
+      "status": "video_only",
+      "enabled": true,
+      "min_confidence": 0.5,
+      "legal_reference": {
+        "act": "Motor Vehicles Act, 1988",
+        "section": "Section 119",
+        "title": "Duty to obey traffic signs",
+        "penalty_section": null,
+        "penalty_title": null,
+        "notes": "Section 119 requires drivers to drive in conformity with mandatory traffic signs and directions. The specific penalty provision applied to signal jumping was not verified for this project and is intentionally left blank.",
+        "source_url": "https://lawx.in/acts/section/46/465/4407",
+        "verification": "Section 119 text checked against an online bare-act copy (lawx.in, 2026-10-07). Penalty section not verified."
+      },
+      "penalty_note": "Penalty section not verified for this project. Consult the current central and state notifications."
+    },
+    {
+      "violation_id": "NO_SEATBELT",
+      "violation_name": "Driver / Passenger Without Seat Belt",
+      "short_label": "Seat-belt check",
+      "description": "Driver or front passenger of a car not wearing a seat belt.",
+      "applicable_vehicle_type": ["car"],
+      "detection_logic": "Not implemented: the reference dataset has no seat-belt annotations, and typical traffic-camera footage cannot resolve a belt through the windscreen reliably.",
+      "required_models": [],
+      "input_types": [],
+      "status": "not_implemented",
+      "enabled": false,
+      "min_confidence": null,
+      "legal_reference": {
+        "act": "Motor Vehicles Act, 1988",
+        "section": "Section 194B",
+        "title": "Use of safety belts and the seating of children",
+        "penalty_section": "Section 194B",
+        "penalty_title": "Use of safety belts and the seating of children",
+        "notes": "Listed for completeness only.",
+        "source_url": "https://lawx.in/acts/section/46/470/4495",
+        "verification": "Section title checked against an online bare-act copy (lawx.in, 2026-10-07)."
+      },
+      "penalty_note": "Not evaluated by this system."
+    },
+    {
+      "violation_id": "LANE_INDISCIPLINE",
+      "violation_name": "Lane / Wrong-Side Driving",
+      "short_label": "Lane check",
+      "description": "Vehicle travelling outside its lane or against the direction of traffic.",
+      "applicable_vehicle_type": ["motorcycle", "car", "bus", "truck"],
+      "detection_logic": "Not implemented: needs reliable lane-marking segmentation and per-camera road geometry, which the available dataset does not provide.",
+      "required_models": [],
+      "input_types": [],
+      "status": "not_implemented",
+      "enabled": false,
+      "min_confidence": null,
+      "legal_reference": {
+        "act": null,
+        "section": null,
+        "title": null,
+        "penalty_section": null,
+        "penalty_title": null,
+        "notes": "Legal provision not verified for this project — intentionally left blank rather than guessed.",
+        "source_url": null,
+        "verification": "Not verified."
+      },
+      "penalty_note": "Not evaluated by this system."
+    },
+    {
+      "violation_id": "MOBILE_PHONE",
+      "violation_name": "Using Mobile Phone While Driving",
+      "short_label": "Phone-use check",
+      "description": "Driver holding or using a handheld phone while driving.",
+      "applicable_vehicle_type": ["motorcycle", "car", "bus", "truck"],
+      "detection_logic": "Not implemented: no annotated phone-use data, and hand/phone detail is rarely visible at traffic-camera resolution.",
+      "required_models": [],
+      "input_types": [],
+      "status": "not_implemented",
+      "enabled": false,
+      "min_confidence": null,
+      "legal_reference": {
+        "act": null,
+        "section": null,
+        "title": null,
+        "penalty_section": null,
+        "penalty_title": null,
+        "notes": "Legal provision not verified for this project — intentionally left blank rather than guessed.",
+        "source_url": null,
+        "verification": "Not verified."
+      },
+      "penalty_note": "Not evaluated by this system."
+    }
+  ]
+}

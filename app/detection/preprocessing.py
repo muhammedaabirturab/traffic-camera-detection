@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov"}
 
 
@@ -20,7 +20,7 @@ def decode_image(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # applies EXIF orientation
     if img is None or img.size == 0:
-        raise InvalidInputError("The file could not be read as an image - it may be corrupted or not a real JPG/PNG.")
+        raise InvalidInputError("The file could not be read as an image - it may be corrupted or not a real JPG/PNG/WebP.")
     h, w = img.shape[:2]
     if h < 32 or w < 32:
         raise InvalidInputError("The image is too small to analyse (minimum 32x32 pixels).")

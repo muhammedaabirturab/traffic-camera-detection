@@ -30,6 +30,8 @@ def group_key(stem: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", type=Path, required=True, help="folder with images + YOLO .txt labels")
+    ap.add_argument("--labels", type=Path, default=None, help="folder with the .txt labels if separate from the images")
+    ap.add_argument("--max-side", type=int, default=0, help="downscale images whose longer side exceeds this (labels are normalised, so unchanged)")
     ap.add_argument("--names", nargs="+", default=["person_bike"], help="class names in index order")
     ap.add_argument("--out", type=Path, default=ROOT / "datasets" / "prepared")
     ap.add_argument("--val", type=float, default=0.15)
@@ -45,7 +47,7 @@ def main() -> None:
     for img in sorted(args.source.iterdir()):
         if img.suffix.lower() not in IMG_EXT:
             continue
-        lbl = img.with_suffix(".txt")
+        lbl = (args.labels / (img.stem + ".txt")) if args.labels else img.with_suffix(".txt")
         if not lbl.exists():
             skipped += 1
             continue
@@ -73,7 +75,18 @@ def main() -> None:
             safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", img.stem)
             for sub in ("images", "labels"):
                 (args.out / sub / split).mkdir(parents=True, exist_ok=True)
-            shutil.copy2(img, args.out / "images" / split / f"{safe}{img.suffix.lower()}")
+            dst = args.out / "images" / split / f"{safe}{img.suffix.lower()}"
+            if args.max_side:
+                import cv2
+                im = cv2.imread(str(img))
+                if im is None:
+                    continue
+                k = args.max_side / max(im.shape[:2])
+                if k < 1:
+                    im = cv2.resize(im, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+                cv2.imwrite(str(dst), im, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            else:
+                shutil.copy2(img, dst)
             shutil.copy2(lbl, args.out / "labels" / split / f"{safe}.txt")
             counts[split] += 1
             for line in lbl.read_text().splitlines():

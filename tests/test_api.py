@@ -132,3 +132,11 @@ def test_long_file_names_keep_their_extension(make_client, jpeg_bytes):
     c = make_client(ScriptedDetector([]))
     r = c.post("/api/analyze/image", files={"file": ("a" * 200 + ".jpg", jpeg_bytes, "image/jpeg")})
     assert r.status_code == 200 and r.json()["filename"].endswith(".jpg")
+
+
+def test_webp_upload_is_accepted(make_client):
+    ok, buf = cv2.imencode(".webp", np.full((120, 160, 3), 100, np.uint8))
+    assert ok
+    c = make_client(ScriptedDetector([]))
+    r = c.post("/api/analyze/image", files={"file": ("pic.webp", buf.tobytes(), "image/webp")})
+    assert r.status_code == 200 and r.json()["filename"] == "pic.webp"

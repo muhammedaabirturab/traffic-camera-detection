@@ -79,7 +79,7 @@ export default function Analyze() {
       </div>
 
       {mode === "image" ? (
-        <DropZone accept=".jpg,.jpeg,.png" hint="JPG, JPEG or PNG · up to 15 MB" onFile={runImage} disabled={busy} />
+        <DropZone accept=".jpg,.jpeg,.png,.webp" hint="JPG, JPEG, PNG or WebP · up to 15 MB" onFile={runImage} disabled={busy} />
       ) : (
         <>
           <DropZone accept=".mp4,.avi,.mov" hint="MP4, AVI or MOV · up to 200 MB · processed in the background with ByteTrack tracking" onFile={runVideo} disabled={busy} />

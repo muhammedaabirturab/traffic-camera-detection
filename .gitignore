@@ -15,6 +15,7 @@ data/
 # Datasets - never committed
 datasets/raw/
 datasets/prepared/
+datasets/prepared_*/
 
 # Training output (curves/metrics we want are copied to docs/figures and app/models)
 runs/
@@ -25,6 +26,7 @@ app/models/*.pt
 app/models/*.onnx
 app/models/*.weights
 !app/models/rider_detector.pt
+!app/models/helmet_detector.pt
 
 # Node
 node_modules/

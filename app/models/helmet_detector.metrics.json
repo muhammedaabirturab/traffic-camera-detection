@@ -1,0 +1,67 @@
+{
+  "model": "yolov8n",
+  "weights": "helmet_detector.pt",
+  "classes": [
+    "bike_with_rider",
+    "no_helmet",
+    "helmet"
+  ],
+  "evaluated_on": "test",
+  "precision": 0.9071306297025643,
+  "recall": 0.8697149846398907,
+  "f1": 0.8880288701616877,
+  "map50": 0.9151694069212049,
+  "map50_95": 0.6551005202411969,
+  "per_class": {
+    "bike_with_rider": {
+      "ap50": 0.9580106362080986,
+      "ap50_95": 0.8165852260201067
+    },
+    "no_helmet": {
+      "ap50": 0.8854922324549331,
+      "ap50_95": 0.570467009482883
+    },
+    "helmet": {
+      "ap50": 0.902005352100583,
+      "ap50_95": 0.5782493252206014
+    }
+  },
+  "training": {
+    "epochs_requested": 25,
+    "image_size": 640,
+    "batch_size": 8,
+    "base_checkpoint": "yolov8n.pt",
+    "hardware": "NVIDIA GeForce MX550",
+    "device": "0",
+    "torch": "2.5.1+cu121",
+    "trained_at": "2026-10-08T11:37:58+00:00",
+    "epochs_completed": 25
+  },
+  "dataset": {
+    "source": "local YOLO-format dataset (see datasets/README.md)",
+    "classes": [
+      "bike_with_rider",
+      "no_helmet",
+      "helmet"
+    ],
+    "unique_image_groups": 2392,
+    "images": {
+      "train": 1794,
+      "val": 359,
+      "test": 239
+    },
+    "boxes": {
+      "train": 6220,
+      "val": 1240,
+      "test": 815
+    },
+    "boxes_per_class": {
+      "bike_with_rider": 3793,
+      "no_helmet": 2810,
+      "helmet": 1672
+    },
+    "images_without_labels_skipped": 0,
+    "split_seed": 42,
+    "note": "Flipped copies are kept in the same split as their original (no leakage)."
+  }
+}

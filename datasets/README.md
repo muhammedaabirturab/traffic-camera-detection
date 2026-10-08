@@ -35,3 +35,9 @@ What the copy used here actually contains (inspected, not assumed):
 
 Any YOLO-format folder works: `--source <folder> --names classA classB ...`.
 For helmet detection see `app/models/README.md`.
+
+## Helmet dataset (EdgeVision)
+
+Used for the helmet detector. EdgeVision Dataset, Gajjar, Patel, Patel, Patel, Dabhi, Trivedi, Goyani, Bhatt - Mendeley Data, v1, DOI 10.17632/j82bnw7gsr.1, **CC BY 4.0**.
+2,392 images (avg ~1154x1411 px), 8,275 boxes, YOLO labels in `labels/yolo/` with classes `BikeWithRider`, `NoHelmet`, `Helmet`.
+Prepared with `--max-side 800` (images downscaled, labels unchanged) into `datasets/prepared_helmet/` (git-ignored). Commands: `app/models/README.md`.

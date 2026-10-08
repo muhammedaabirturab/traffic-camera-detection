@@ -7,8 +7,8 @@ from app.config import Settings
 from app.detection.yolo_detector import YoloDetector
 
 
-def read_metrics(s: Settings) -> dict | None:
-    f = s.model_path.with_suffix(".metrics.json")
+def read_metrics(s: Settings, helmet: bool = False) -> dict | None:
+    f = (s.helmet_model_path if helmet else s.model_path).with_suffix(".metrics.json")
     if not f.exists():
         return None
     try:
@@ -23,11 +23,12 @@ def model_info(detector: YoloDetector | None, s: Settings) -> dict:
     return {
         "framework": "Ultralytics YOLO",
         "task": "Object detection (+ rule-based traffic inference)",
-        "input": "Image (JPG/PNG) / Video (MP4/AVI/MOV)",
-        "dataset": "Motorbike / rider traffic dataset (single class: person_bike). No helmet labels.",
+        "input": "Image (JPG/PNG/WebP) / Video (MP4/AVI/MOV)",
+        "dataset": "Rider detector: motorbike rider dataset (person_bike). Helmet detector: EdgeVision dataset (CC BY 4.0; no_helmet / helmet / bike_with_rider).",
         "models": status,
         "metrics_available": metrics is not None,
         "metrics": metrics,
+        "helmet_metrics": read_metrics(s, helmet=True),
         "metrics_message": None if metrics else "Model not trained / metrics unavailable. Run scripts/train.py to generate real metrics.",
         "helmet_model": bool(detector and detector.helmet_available),
         "config": {

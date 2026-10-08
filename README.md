@@ -20,7 +20,7 @@ evidence image and a plain-language explanation. Every result is labelled *"Requ
 | Vehicle detection & counting (motorcycle, car, bus, truck, bicycle) | ✅ | ✅ unique via tracking | COCO-pretrained YOLOv8n |
 | Rider ↔ two-wheeler association | ✅ | ✅ | geometric relationship analysis (`docs/methodology.md`) |
 | **More than two persons on a two-wheeler** | ✅ | ✅ temporally validated | works with the shipped models |
-| **Rider / pillion without helmet** | ⚙️ needs helmet model | ⚙️ | rule + logic implemented; the reference dataset has **no helmet labels**, so without a helmet model the UI reports *"helmet not assessed"* and raises no helmet violations |
+| **Rider / pillion without helmet** | ✅ | ✅ temporally validated | helmet detector trained on the EdgeVision dataset + head-region search; if the helmet model file is removed the UI reports *"helmet not assessed"* instead of guessing |
 | **Stop line crossed on red** | ❌ by design | ✅ experimental | model cannot read signals; operator supplies stop line + red window |
 | Lane violations, number-plate OCR | — | — | not implemented (listed as such in the rule database) |
 | Insufficient-evidence state, confidence bands, duplicate filtering | ✅ | ✅ | all thresholds configurable |
@@ -50,13 +50,18 @@ The reference dataset (see the Kaggle notebook it comes from, *motorbike-and-hel
 * About half the files are horizontally flipped copies; the split script keeps a flip in the same split as its original (no leakage).
 * Split used: train 594 / val 120 / test 80 images (`dataset_stats.json`).
 
-The dataset is **not** in the repository. Setup: [datasets/README.md](datasets/README.md).
+The rider dataset has no helmet labels, so a second dataset trains the helmet detector:
+
+* **EdgeVision Dataset** (Gajjar et al., Mendeley Data, DOI 10.17632/j82bnw7gsr.1, **CC BY 4.0**): 2,392 images, classes `BikeWithRider`, `NoHelmet`, `Helmet`.
+  Split used: train 1794 / val 359 / test 239 images, downscaled to 800 px on the long side.
+
+Datasets are **not** in the repository. Setup: [datasets/README.md](datasets/README.md).
 
 ## Model
 
 * `yolov8n.pt` (COCO) for vehicles and persons.
 * `rider_detector.pt`: YOLOv8n fine-tuned on `person_bike` (committed, ~6 MB).
-* Optional helmet model: see [app/models/README.md](app/models/README.md).
+* `helmet_detector.pt`: YOLOv8n fine-tuned on EdgeVision (committed, ~6 MB) - classes `bike_with_rider`, `no_helmet`, `helmet`. Trained here from the official `yolov8n.pt`; no third-party weights are used.
 
 ## Installation
 
@@ -123,7 +128,7 @@ Training writes the weights to `app/models/`, real metrics to `app/models/rider_
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | status, device, whether models/helmet model are loaded |
-| POST | `/api/analyze/image` | multipart `file` (jpg/jpeg/png) → detections, overlay, violations, summary, evidence |
+| POST | `/api/analyze/image` | multipart `file` (jpg/jpeg/png/webp) → detections, overlay, violations, summary, evidence |
 | POST | `/api/analyze/video` | multipart `file` (mp4/avi/mov) + optional `stop_line`, `red_from`, `red_to`, `direction` → `{job_id}` |
 | GET | `/api/jobs/{id}` | video progress / result id |
 | GET | `/api/rules` | rule database with runtime status |
@@ -180,6 +185,22 @@ the images are mostly clear daytime scooter photos. This measures how well the r
 Metrics for the triple-riding rule itself were **not** measured: the dataset has no per-rider or violation labels, so only qualitative checks were done
 (on the dataset images the rule is deliberately conservative - most crowded scenes end up as *insufficient evidence*). Training curves: `docs/figures/rider_detector/`.
 
+### Helmet detector (EdgeVision, held-out test split: 239 images, 815 boxes)
+
+| Metric | Value |
+|---|---|
+| Precision | 0.907 |
+| Recall | 0.870 |
+| F1 | 0.888 |
+| mAP@50 | 0.915 |
+| mAP@50-95 | 0.655 |
+| AP@50 `no_helmet` | 0.885 |
+| AP@50 `helmet` | 0.902 |
+
+YOLOv8n, 25 epochs, image size 640, batch 8, NVIDIA GeForce MX550. Curves: `docs/figures/helmet_detector/`.
+These are detector metrics on the EdgeVision test split only. The end-to-end *rule* (rider association + head-region search) has no labelled benchmark; it was spot-checked on the rider dataset images
+(helmeted police convoy: no violations; bare-headed scooter riders: flagged). Expect more errors on small/blurred heads and unfamiliar camera angles.
+
 ## Screenshots
 
 Run the app and save your own screenshots to `docs/screenshots/` (none are committed because none were fabricated):
@@ -195,12 +216,12 @@ dashboard, analysis result with a violation card, model page, rules page.
 6. Show the **Traffic Intelligence Score**.
 7. **Detection History** — the analysis was saved; open it again.
 8. **Traffic Rules** — the JSON-driven rule table (status shows what is active vs needs a helmet model).
-9. **Model** — real metrics read from the training run; explain limitations honestly.
+9. **Model** — real metrics for both detectors read from their training runs; explain limitations honestly.
 10. Optional: **Analyze → Video** to show tracking, the timeline chart and temporal validation.
 
 ## Limitations
 
-* No helmet labels in the dataset → helmet compliance is *not assessed* until a helmet model is added.
+* The helmet detector was trained on one dataset (EdgeVision); small, blurred, occluded or far-away heads are the main failure cases, and a helmet-like object (hood, cap) can confuse it.
 * Small training set (a few hundred distinct images, mostly clear daytime scooter photos); expect errors on real CCTV footage (night, rain, occlusion, distance).
 * Association logic is heuristic geometry, not learned; dense crowds of scooters make rider counting ambiguous (such cases become *insufficient evidence*).
 * Red-light checking depends on operator-supplied stop line and signal timing. Lane violations and number-plate OCR are not implemented.
@@ -208,14 +229,14 @@ dashboard, analysis result with a violation card, model page, rules page.
 
 ## Future improvements
 
-Helmet/no-helmet dataset and model · number-plate detection + OCR (clearly labelled as AI-generated reading) · automatic signal-state detection · lane segmentation · per-camera calibration · larger and more diverse training data.
+More diverse helmet data (night, rain, CCTV angles) · number-plate detection + OCR (clearly labelled as AI-generated reading) · automatic signal-state detection · lane segmentation · per-camera calibration · larger and more diverse training data.
 
 ## Legal disclaimer
 
 For educational use only. Indian traffic laws and penalties change; the legal references stored in `app/rules/traffic_rules.json` are
 flagged `legal_verified: false` and must be checked against the current Motor Vehicles Act, 1988, the Central Motor Vehicles Rules and
 official notifications before being relied upon. No penalty amounts are stored. Outputs are AI-detected *possible* violations based on
-available visual evidence and require human verification. Ultralytics YOLO is AGPL-3.0 licensed.
+available visual evidence and require human verification. Ultralytics YOLO is AGPL-3.0 licensed. The EdgeVision dataset is CC BY 4.0 (attribution above).
 
 ## Authors
 

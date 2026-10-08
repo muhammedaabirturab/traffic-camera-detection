@@ -6,7 +6,7 @@
 |---|---|---|---|
 | COCO detector | Ultralytics `yolov8n.pt` (official, pretrained, unchanged) | person, bicycle, car, motorcycle, bus, truck (others ignored) | vehicles + persons |
 | Rider detector | `yolov8n.pt` **fine-tuned here** on the `person_bike` dataset | `person_bike` | person-on-two-wheeler corroboration |
-| Helmet detector | *not shipped* | `helmet` / `no_helmet` (configurable) | enables the helmet rules |
+| Helmet detector | `yolov8n.pt` **fine-tuned here** on the EdgeVision dataset (CC BY 4.0) | `bike_with_rider`, `no_helmet`, `helmet` | helmet rules (`no_helmet_rider`, `no_helmet_pillion`) |
 
 YOLOv8-nano (about 3 M parameters) was chosen so everything runs on a student laptop (a 2 GB MX-class GPU or plain CPU).
 
@@ -16,6 +16,11 @@ See `datasets/README.md`. In short: 795 images, a single class `person_bike`, no
 are horizontal flips of the others. `scripts/prepare_dataset.py` groups an image with its flip, then splits groups
 **train / val / test = 75 % / 15 % / 10 %** (seed 42) so near-duplicates never straddle splits.
 The exact counts used for the committed weights are in `app/models/rider_detector.metrics.json` and on the Model page.
+
+### Helmet dataset
+
+EdgeVision (Mendeley Data, DOI 10.17632/j82bnw7gsr.1): 2,392 motorcycle-traffic images, 8,275 boxes. 75/15/10 split by image (seed 42), images downscaled to 800 px.
+Metrics for the helmet model are in `app/models/helmet_detector.metrics.json` and on the Model page.
 
 ## Training
 

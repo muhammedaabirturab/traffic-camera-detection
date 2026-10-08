@@ -1,0 +1,53 @@
+{
+  "model": "yolov8n",
+  "weights": "rider_detector.pt",
+  "classes": [
+    "person_bike"
+  ],
+  "evaluated_on": "test",
+  "precision": 0.9998998793528843,
+  "recall": 0.9651162790697675,
+  "f1": 0.9822002194404355,
+  "map50": 0.9797118983957219,
+  "map50_95": 0.7482024440594498,
+  "per_class": {
+    "person_bike": {
+      "ap50": 0.9797118983957219,
+      "ap50_95": 0.7482024440594498
+    }
+  },
+  "training": {
+    "epochs_requested": 50,
+    "image_size": 640,
+    "batch_size": 8,
+    "base_checkpoint": "yolov8n.pt",
+    "hardware": "NVIDIA GeForce MX550",
+    "device": "0",
+    "torch": "2.5.1+cu121",
+    "trained_at": "2026-10-08T08:39:53+00:00",
+    "epochs_completed": 50
+  },
+  "dataset": {
+    "source": "local YOLO-format dataset (see datasets/README.md)",
+    "classes": [
+      "person_bike"
+    ],
+    "unique_image_groups": 398,
+    "images": {
+      "train": 594,
+      "val": 120,
+      "test": 80
+    },
+    "boxes": {
+      "train": 714,
+      "val": 144,
+      "test": 86
+    },
+    "boxes_per_class": {
+      "person_bike": 944
+    },
+    "images_without_labels_skipped": 1,
+    "split_seed": 42,
+    "note": "Flipped copies are kept in the same split as their original (no leakage)."
+  }
+}

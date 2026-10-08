@@ -1,111 +1,71 @@
-import { useEffect, useState } from 'react'
-import { NavLink } from 'react-router-dom'
-import { BookOpenText, Cpu, History, Info, LayoutDashboard, ScanSearch, Scale, ShieldCheck } from 'lucide-react'
-import { useStatus } from '../lib/status.jsx'
+import { useEffect, useState } from "react";
+import { NavLink } from "react-router-dom";
+import { api } from "../api.js";
 
 const NAV = [
-  { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
-  { to: '/analyze', label: 'Analyze', icon: ScanSearch },
-  { to: '/history', label: 'Detection History', icon: History },
-  { to: '/model', label: 'Model', icon: Cpu },
-  { to: '/rules', label: 'Traffic Rules', icon: Scale },
-  { to: '/about', label: 'About', icon: Info },
-]
+  ["/", "Dashboard"],
+  ["/analyze", "Analyze"],
+  ["/history", "Detection History"],
+  ["/model", "Model"],
+  ["/rules", "Traffic Rules"],
+  ["/about", "About"],
+];
 
-function Clock() {
-  const [now, setNow] = useState(new Date())
+export function Logo() {
+  return (
+    <svg width="34" height="34" viewBox="0 0 64 64" aria-hidden="true">
+      <rect width="64" height="64" rx="14" fill="#0e1a35" stroke="#1f2c4a" />
+      <path d="M32 9 13 17v13c0 11 7.5 20 19 25 11.500-5 19-14 19-25V17z" fill="none" stroke="#22d3ee" strokeWidth="3.5" strokeLinejoin="round" />
+      <circle cx="32" cy="30" r="6.500" fill="#22d3ee" />
+      <circle cx="32" cy="30" r="2.500" fill="#0e1a35" />
+    </svg>
+  );
+}
+
+export default function Layout({ children }) {
+  const [health, setHealth] = useState(null);
+  const [offline, setOffline] = useState(false);
+
   useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000)
-    return () => clearInterval(id)
-  }, [])
-  return (
-    <div className="clock">
-      {now.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' })} ·{' '}
-      {now.toLocaleTimeString(undefined, { hour12: false })}
-    </div>
-  )
-}
+    let alive = true;
+    const poll = () =>
+      api.health().then((h) => alive && (setHealth(h), setOffline(false))).catch(() => alive && setOffline(true));
+    poll();
+    const t = setInterval(poll, 15000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
 
-function DetectorRow({ name, state }) {
-  const cls = state == null ? 'off' : state ? 'ok' : 'warn'
-  return (
-    <div className="sys-row">
-      <span>
-        <span className={`dot ${cls}`} />
-        {name}
-      </span>
-      <span className="mono" style={{ fontSize: 11 }}>
-        {state == null ? '—' : state ? 'READY' : 'N/A'}
-      </span>
-    </div>
-  )
-}
+  const state = offline ? "bad" : health?.models_loaded ? "ok" : "warn";
+  const label = offline ? "Backend offline" : health?.models_loaded ? `Models ready · ${health.device}` : health ? "Models not loaded" : "Connecting…";
 
-export default function Layout({ title, sub, children }) {
-  const { health, online } = useStatus()
-  const d = health?.detectors
   return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">
-            <ShieldCheck size={22} />
-          </div>
-          <div>
-            <div className="brand-name">
-              TRAFFIC<span>GUARD</span> AI
-            </div>
-            <div className="brand-sub">Intelligent Traffic Violation Detection System</div>
-          </div>
-        </div>
+    <div className="shell">
+      <header className="topbar">
+        <NavLink to="/" className="brand">
+          <Logo />
+          <span>
+            <b>TRAFFICGUARD AI</b>
+            <small>Intelligent Traffic Violation Detection System</small>
+          </span>
+        </NavLink>
         <nav className="nav">
-          <div className="nav-label">Operations</div>
-          {NAV.map(({ to, label, icon: Icon, end }) => (
-            <NavLink key={to} to={to} end={end}>
-              <Icon size={17} />
-              {label}
+          {NAV.map(([to, name]) => (
+            <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => (isActive ? "active" : "")}>
+              {name}
             </NavLink>
           ))}
         </nav>
-        <div className="sidebar-foot">
-          <div className="nav-label" style={{ paddingLeft: 6 }}>System status</div>
-          <div className="sys-row">
-            <span>
-              <span className={`dot ${online ? 'ok' : 'warn'}`} />
-              API server
-            </span>
-            <span className="mono" style={{ fontSize: 11 }}>{online ? 'ONLINE' : 'OFFLINE'}</span>
-          </div>
-          {health && !health.models_loaded && (
-            <div className="sys-row">
-              <span>
-                <span className="dot warn" />
-                Loading models…
-              </span>
-            </div>
-          )}
-          <DetectorRow name="Vehicle YOLO" state={d?.vehicle} />
-          <DetectorRow name="Helmet model" state={d?.helmet} />
-          <DetectorRow name="Rider model" state={d?.rider} />
-          <Clock />
-        </div>
-      </aside>
-      <main className="main">
-        <header className="topbar">
-          <div>
-            <div className="eyebrow">TrafficGuard AI · AI-Powered Indian Traffic Monitoring</div>
-            <h1 className="page-title">{title}</h1>
-            <div className="page-sub">{sub}</div>
-          </div>
-          <div className="top-chips">
-            <span className="chip cyan">
-              <BookOpenText size={12} /> EDUCATIONAL USE
-            </span>
-            <span className="chip">POSSIBLE VIOLATIONS · HUMAN VERIFICATION REQUIRED</span>
-          </div>
-        </header>
-        <div className="content">{children}</div>
-      </main>
+        <span className="spacer" />
+        <span className="status-pill" title={health?.message || ""}>
+          <span className={`dot ${state}`} /> {label}
+        </span>
+      </header>
+      {offline && <div className="banner">The analysis backend is not reachable. Start it with <code>python -m app.main</code>, then reload.</div>}
+      {health && !health.models_loaded && !offline && <div className="banner">{health.message || "Detection models are not loaded."} See app/models/README.md.</div>}
+      <main className="main">{children}</main>
+      <footer className="footer">
+        TrafficGuard AI · Educational project · Results are AI-detected possible violations and require human verification.
+      </footer>
     </div>
-  )
+  );
 }

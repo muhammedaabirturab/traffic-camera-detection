@@ -1,50 +1,21 @@
-"""Evidence generation: annotated frames, cropped evidence images and thumbnails.
-
-Files are written to ``data/results/<analysis_id>/`` and served by the API under
-``/media/<analysis_id>/<file>`` so the dashboard and the history page can show them.
-"""
-
+"""Evidence images: an annotated crop around each violation."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
 
-from app.detection.types import Box, Detection
-from app.utils import visualization as viz
+from app.utils.visualization import crop_with_padding
 
 
-class EvidenceWriter:
-    def __init__(self, results_dir: Path, analysis_id: str):
-        self.analysis_id = analysis_id
-        self.dir = Path(results_dir) / analysis_id
-        self.dir.mkdir(parents=True, exist_ok=True)
-
-    def url(self, name: str) -> str:
-        return f"/media/{self.analysis_id}/{name}"
-
-    def save(self, name: str, img: np.ndarray, quality: int = 90) -> str:
-        cv2.imwrite(str(self.dir / name), img, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        return self.url(name)
-
-    def thumbnail(self, img: np.ndarray, name: str = "thumb.jpg", width: int = 360) -> str:
-        h, w = img.shape[:2]
-        scale = width / w
-        small = cv2.resize(img, (width, max(1, int(h * scale))), interpolation=cv2.INTER_AREA) if scale < 1 else img
-        return self.save(name, small, quality=80)
-
-    def violation_evidence(self, index: int, frame: np.ndarray, detections: list[Detection], region: Box,
-                           title: str, confidence: float, extra: Optional[list[Detection]] = None) -> dict:
-        """Save a full annotated frame and a close-up crop for one violation."""
-        relevant = [d for d in detections if d.box.intersection(region.expand(0.2)) > 0]
-        if extra:
-            relevant += [d for d in extra if d not in relevant]
-        annotated = viz.draw_detections(frame, relevant)
-        annotated = viz.draw_violation(annotated, region, title, confidence)
-        full_url = self.save(f"violation_{index:02d}_frame.jpg", annotated)
-        # The close-up uses thin boxes without text so the rider stays clearly visible.
-        plain = viz.draw_violation(viz.draw_detections(frame, relevant, labels=False), region, title, label=False)
-        crop_url = self.save(f"violation_{index:02d}_crop.jpg", viz.crop(plain, region))
-        return {"frame": full_url, "crop": crop_url}
+def save_evidence(annotated_frame: np.ndarray, box, out_path: Path, max_side: int = 900) -> Path:
+    """Crop `box` (pixels) from an already-annotated frame, with context padding, and save as JPEG."""
+    crop = crop_with_padding(annotated_frame, box, pad=0.35)
+    h, w = crop.shape[:2]
+    if max(h, w) > max_side:
+        k = max_side / max(h, w)
+        crop = cv2.resize(crop, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return out_path

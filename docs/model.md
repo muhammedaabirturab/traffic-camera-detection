@@ -1,63 +1,52 @@
-# Model
+# Model & training
 
-## Why YOLO
+## Models
 
-YOLO ("You Only Look Once") is a single-stage detector: one forward pass of a convolutional network
-predicts class scores and bounding boxes for the whole image, which makes it fast enough for video on a
-laptop. This project uses **Ultralytics YOLO11** (nano variant by default) — a CSP-style backbone, a
-feature-pyramid neck and an anchor-free decoupled detection head — plus the original **Darknet YOLOv3**
-models from the Kaggle reference for helmet/rider detection.
-
-## Detectors
-
-| Role | Model | Classes used | Trained on |
+| Model | Source | Classes | Role |
 |---|---|---|---|
-| Vehicle / person / signal | `yolo11n.pt` (Ultralytics, 2.6 M parameters) | person, bicycle, car, motorcycle, bus, truck, traffic light | COCO 2017 (official weights) |
-| Helmet | YOLOv3 (Darknet) `yolov3-helmet.weights` **or** YOLO11 `helmet.pt` | `Helmet` (+ bare head if your dataset has it) | Kaggle `helmet-detection-yolov3` (pretrained) / your helmet dataset |
-| Rider | YOLO11 `rider.pt` **or** YOLOv3 `yolov3-obj_final.weights` | person on two-wheeler | Kaggle `detect-person-on-motorbike-or-scooter` |
-| Plate (optional) | YOLO11 `plate.pt` | number plate | not provided |
+| COCO detector | Ultralytics `yolov8n.pt` (official, pretrained, unchanged) | person, bicycle, car, motorcycle, bus, truck (others ignored) | vehicles + persons |
+| Rider detector | `yolov8n.pt` **fine-tuned here** on the `person_bike` dataset | `person_bike` | person-on-two-wheeler corroboration |
+| Helmet detector | *not shipped* | `helmet` / `no_helmet` (configurable) | enables the helmet rules |
 
-## Training pipeline
+YOLOv8-nano (about 3 M parameters) was chosen so everything runs on a student laptop (a 2 GB MX-class GPU or plain CPU).
 
-```
-Kaggle dataset ──► scripts/prepare_dataset.py ──► datasets/<role>/ (train/val/test + data.yaml)
-                                                     │
-                                                     ▼
-                         scripts/train.py  (transfer learning from yolo11n.pt)
-                                                     │
-                     best.pt evaluated on held-out TEST split (Ultralytics val)
-                                                     │
-              ┌──────────────────────────────────────┴───────────────────────────────┐
-              ▼                                                                      ▼
-     models/<role>.pt                                     models/metrics/<role>.json + plots
-     (loaded by the API)                                  (shown on the Model page)
-```
+## Dataset
 
-* **Split** — 75 / 15 / 10 % by default, grouped so that an image and its `__flip` copy never end up in
-  different splits (prevents leakage).
-* **Transfer learning** — training starts from COCO weights; Ultralytics' default augmentation
-  (mosaic, HSV jitter, flips, scaling) is used; early stopping with `--patience 20`.
-* **Metrics** (`scripts/_metrics.py`)
-  * Precision = TP / (TP + FP), Recall = TP / (TP + FN)
-  * F1 = 2PR / (P + R)
-  * mAP@50 — mean average precision with IoU ≥ 0.5 counted as a match
-  * mAP@50-95 — mAP averaged over IoU thresholds 0.50 … 0.95 (stricter localisation)
-  * per-class values, confusion matrix, PR/F1 curves and loss curves are saved as plots.
+See `datasets/README.md`. In short: 795 images, a single class `person_bike`, no helmet labels, about half of the images
+are horizontal flips of the others. `scripts/prepare_dataset.py` groups an image with its flip, then splits groups
+**train / val / test = 75 % / 15 % / 10 %** (seed 42) so near-duplicates never straddle splits.
+The exact counts used for the committed weights are in `app/models/rider_detector.metrics.json` and on the Model page.
 
-## Commands
+## Training
 
 ```bash
-python scripts/prepare_dataset.py --source <kaggle folder> --out datasets/rider --names rider
-python scripts/train.py    --data datasets/rider/data.yaml --role rider --epochs 60 --device 0
-python scripts/validate.py --weights models/rider.pt --data datasets/rider/data.yaml --role rider
-python scripts/predict.py  path/to/image_or_video
-python scripts/export_model.py --weights models/rider.pt --format onnx
+python scripts/prepare_dataset.py --source <folder with images + .txt labels>
+python scripts/train.py --epochs 50 --batch 8 --imgsz 640
 ```
 
-## Results
+* Fine-tunes `app/models/yolov8n.pt` with Ultralytics defaults (AdamW chosen by `optimizer=auto`, mosaic/HSV/flip augmentation, cosine LR, early stopping with patience 20).
+* Mixed precision is **off by default**: on the GTX16xx/MX-class GPU used during development FP16 produced NaN losses. Pass `--amp` on modern GPUs.
+* After training it evaluates the best weights on the held-out **test** split and writes
+  `app/models/rider_detector.metrics.json` (precision, recall, F1, mAP@50, mAP@50-95, per-class AP, epochs, image size,
+  batch size, hardware, dataset counts) and copies the curves into `docs/figures/rider_detector/`.
 
-**No metrics are published in this repository.** The models were not trained in the development
-environment (the Kaggle data could not be downloaded there), and the COCO and reference YOLOv3 weights
-were not re-evaluated on project data. After you train, the Model page shows the measured values read
-from `models/metrics/*.json`. Report those numbers — together with the split they were measured on —
-in your presentation, not figures from elsewhere.
+## Metrics
+
+Precision, recall, F1, mAP@50 and mAP@50-95 are produced by Ultralytics' validator (`scripts/validate.py` repeats the
+test-split evaluation any time). **They are read from the JSON file by the Model page - never typed in.**
+If the file does not exist the page says *"Model not trained / metrics unavailable"*.
+
+How to read them honestly: the test split holds only about 80 images from roughly 40 distinct scenes, and the dataset
+is dominated by clear, front-on scooter photos. The numbers describe *this* dataset, not real CCTV conditions
+(night, rain, occlusion, far-away cameras), where performance will be lower.
+
+## Export
+
+```bash
+python scripts/export_model.py --weights app/models/rider_detector.pt --format onnx
+```
+
+## Reference Darknet model
+
+The dataset package also contained a Darknet YOLOv3 config and trained weights (`yolov3-obj_final.weights`, 2000 iterations).
+They were not used: they require the Darknet/OpenCV-DNN runtime and the Ultralytics workflow offers tracking, export and evaluation out of the box.

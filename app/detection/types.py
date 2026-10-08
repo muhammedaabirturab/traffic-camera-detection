@@ -1,174 +1,78 @@
-"""Shared data structures for the detection pipeline."""
-
+"""Plain data structures shared by the detection, rule and analysis layers."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Optional
 
-# Canonical labels used everywhere after detection. Detector-specific class
-# names (COCO "motorcycle", Darknet "Helmet", a custom "Without Helmet" ...)
-# are normalised to these via LABEL_ALIASES.
+Box = tuple[float, float, float, float]  # x1, y1, x2, y2 in pixels
+
 VEHICLE_LABELS = {"motorcycle", "bicycle", "car", "bus", "truck"}
-TWO_WHEELER_LABELS = {"motorcycle"}
-
-LABEL_ALIASES = {
-    "motorcycle": "motorcycle", "motorbike": "motorcycle", "motor bike": "motorcycle",
-    "scooter": "motorcycle", "two-wheeler": "motorcycle", "two_wheeler": "motorcycle",
-    "bicycle": "bicycle", "bike": "bicycle",
-    "car": "car", "bus": "bus", "truck": "truck", "lorry": "truck",
-    "person": "person", "pedestrian": "person",
-    "traffic light": "traffic_light", "traffic_light": "traffic_light",
-    "helmet": "helmet", "with helmet": "helmet", "with_helmet": "helmet", "withhelmet": "helmet",
-    "without helmet": "no_helmet", "without_helmet": "no_helmet", "no helmet": "no_helmet",
-    "no_helmet": "no_helmet", "nohelmet": "no_helmet", "head": "no_helmet",
-    "rider": "rider", "person on bike": "rider", "person_on_bike": "rider",
-    "motorcyclist": "rider", "person on motorbike": "rider",
-    "license plate": "number_plate", "license_plate": "number_plate", "licence plate": "number_plate",
-    "number plate": "number_plate", "number_plate": "number_plate", "plate": "number_plate",
-}
-
-
-def canonical_label(raw: str) -> Optional[str]:
-    """Map a detector class name to a canonical label, or None if irrelevant."""
-    return LABEL_ALIASES.get(raw.strip().lower())
-
-
-@dataclass
-class Box:
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-    @property
-    def w(self) -> float:
-        return max(0.0, self.x2 - self.x1)
-
-    @property
-    def h(self) -> float:
-        return max(0.0, self.y2 - self.y1)
-
-    @property
-    def area(self) -> float:
-        return self.w * self.h
-
-    @property
-    def cx(self) -> float:
-        return (self.x1 + self.x2) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.y1 + self.y2) / 2
-
-    def intersection(self, other: "Box") -> float:
-        iw = min(self.x2, other.x2) - max(self.x1, other.x1)
-        ih = min(self.y2, other.y2) - max(self.y1, other.y1)
-        return max(0.0, iw) * max(0.0, ih)
-
-    def iou(self, other: "Box") -> float:
-        inter = self.intersection(other)
-        union = self.area + other.area - inter
-        return inter / union if union > 0 else 0.0
-
-    def union(self, other: "Box") -> "Box":
-        return Box(min(self.x1, other.x1), min(self.y1, other.y1), max(self.x2, other.x2), max(self.y2, other.y2))
-
-    def expand(self, fx: float, fy: Optional[float] = None) -> "Box":
-        fy = fx if fy is None else fy
-        dx, dy = self.w * fx, self.h * fy
-        return Box(self.x1 - dx, self.y1 - dy, self.x2 + dx, self.y2 + dy)
-
-    def clip(self, width: int, height: int) -> "Box":
-        return Box(max(0, self.x1), max(0, self.y1), min(width, self.x2), min(height, self.y2))
-
-    def as_list(self) -> list[float]:
-        return [round(self.x1, 1), round(self.y1, 1), round(self.x2, 1), round(self.y2, 1)]
 
 
 @dataclass
 class Detection:
-    """A single object found by a YOLO model, after label normalisation."""
-
-    label: str  # canonical label
-    raw_label: str  # class name as produced by the model
+    label: str  # canonical: person, motorcycle, bicycle, car, bus, truck, rider_unit, helmet, no_helmet
     confidence: float
     box: Box
-    source: str  # which detector produced it: "vehicle", "helmet", "rider", "plate"
+    source: str = "coco"  # coco | rider | helmet
     track_id: Optional[int] = None
-    det_id: int = -1  # index within the frame, assigned by the pipeline
 
-    def to_dict(self) -> dict:
+    @property
+    def width(self) -> float:
+        return max(0.0, self.box[2] - self.box[0])
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.box[3] - self.box[1])
+
+    def to_dict(self, img_w: int, img_h: int) -> dict:
+        x1, y1, x2, y2 = self.box
         return {
-            "id": self.det_id,
             "label": self.label,
-            "raw_label": self.raw_label,
-            "confidence": round(self.confidence, 4),
-            "bbox": self.box.as_list(),
+            "confidence": round(float(self.confidence), 4),
+            "box": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+            "box_norm": [round(x1 / img_w, 5), round(y1 / img_h, 5), round(x2 / img_w, 5), round(y2 / img_h, 5)],
             "source": self.source,
             "track_id": self.track_id,
         }
 
 
 @dataclass
-class RiderAssessment:
-    """Outcome of the helmet check for one person associated with a two-wheeler."""
-
+class RiderLink:
     person: Detection
-    association: float
-    helmet: Optional[Detection] = None
-    no_helmet: Optional[Detection] = None
-    status: str = "unknown"  # "helmet", "no_helmet", "insufficient_evidence", "not_evaluated"
-    reason: str = ""
-    max_nearby_helmet_conf: float = 0.0
+    score: float  # 0..1 association score with a two-wheeler
+    strong: bool
+    helmet_status: str = "not_assessed"  # helmet | no_helmet | no_helmet_inferred | unknown | not_assessed
+    helmet_confidence: float = 0.0
+    role: str = "rider"  # rider | pillion (front-most / largest person is the driver)
 
 
 @dataclass
 class TwoWheelerUnit:
-    """A motorcycle together with the people judged to be riding it."""
-
-    vehicle: Detection
-    riders: list[RiderAssessment] = field(default_factory=list)
-    supported_by_rider_model: bool = False
+    unit_id: int
+    bike_box: Box
+    bike_conf: float
+    kind: str = "motorcycle"  # motorcycle | bicycle
+    origin: str = "coco"  # coco | rider_model | both
+    rider_box: Optional[Box] = None  # box from the rider model (person + bike), if matched
+    track_id: Optional[int] = None
+    riders: list[RiderLink] = field(default_factory=list)  # strongly associated persons
+    weak_links: list[RiderLink] = field(default_factory=list)  # ambiguous persons (not counted)
 
     @property
     def box(self) -> Box:
-        b = self.vehicle.box
-        for r in self.riders:
-            b = b.union(r.person.box)
-        return b
+        """Box covering the bike and its riders (used for drawing / evidence crops)."""
+        boxes = [self.bike_box] + ([self.rider_box] if self.rider_box else []) + [r.person.box for r in self.riders]
+        return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
 @dataclass
-class ViolationCandidate:
-    """Output of relationship analysis, before the rule engine attaches legal context."""
-
-    rule_id: str
+class Finding:
+    """One rule evaluation outcome for one two-wheeler (before rule-database enrichment)."""
+    violation_id: str
     confidence: float
-    vehicle: Detection
-    subjects: list[Detection]
-    evidence: str  # short machine-generated statement of what was (not) seen
-    region: Box
-    details: dict = field(default_factory=dict)
-
-    def summary(self) -> dict:
-        d = asdict(self)
-        d.pop("vehicle"), d.pop("subjects"), d.pop("region")
-        return d
-
-
-@dataclass
-class Observation:
-    """Something the system looked at but could not decide on (insufficient evidence)."""
-
-    rule_id: str
-    message: str
-    region: Optional[Box] = None
-    confidence: float = 0.0
-
-    def to_dict(self) -> dict:
-        return {
-            "rule_id": self.rule_id,
-            "message": self.message,
-            "bbox": self.region.as_list() if self.region else None,
-            "confidence": round(self.confidence, 4),
-        }
+    unit: TwoWheelerUnit
+    evidence: str
+    status: str = "possible"  # possible | insufficient_evidence
+    people: list[Detection] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)

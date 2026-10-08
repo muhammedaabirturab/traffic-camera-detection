@@ -1,131 +1,76 @@
-"""Central configuration for TrafficGuard AI.
-
-Every threshold that influences whether something is reported as a possible
-violation lives here, so it can be tuned (and explained in a viva) without
-touching detection code. Values can be overridden with environment variables
-prefixed ``TG_`` (for example ``TG_CONF_HIGH=0.9``) or a ``.env`` file in the
-project root.
-"""
-
+"""Central configuration. Every value can be overridden with an environment variable or a `.env` file."""
 from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parents[1]
+APP_DIR = ROOT_DIR / "app"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="TG_", env_file=PROJECT_ROOT / ".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", env_file_encoding="utf-8", extra="ignore")
 
-    # ------------------------------------------------------------------ paths
-    models_dir: Path = PROJECT_ROOT / "models"
-    data_dir: Path = PROJECT_ROOT / "data"  # uploads, results, history DB (git-ignored)
-    rules_file: Path = PROJECT_ROOT / "app" / "rules" / "traffic_rules.json"
-    frontend_dist: Path = PROJECT_ROOT / "frontend" / "dist"
+    # --- models -----------------------------------------------------------------------------
+    # Rider detector: YOLO fine-tuned on the `person_bike` dataset (scripts/train.py).
+    model_path: Path = APP_DIR / "models" / "rider_detector.pt"
+    # General vehicle/person detector (COCO). Downloaded automatically by Ultralytics if missing.
+    coco_model_path: Path = APP_DIR / "models" / "yolov8n.pt"
+    # Optional helmet detector. Not shipped: the reference dataset has no helmet labels.
+    helmet_model_path: Path = APP_DIR / "models" / "helmet_detector.pt"
+    helmet_class_names: str = "helmet,with helmet,with_helmet,hardhat"
+    no_helmet_class_names: str = "no_helmet,no helmet,without helmet,without_helmet,head"
 
-    # ------------------------------------------------------------------ models
-    # General traffic detector. COCO-pretrained Ultralytics YOLO: detects
-    # person, bicycle, car, motorcycle, bus, truck, traffic light (real COCO classes).
-    # Downloaded automatically by Ultralytics on first use if not present.
-    vehicle_model: str = "yolo11n.pt"
-    # Helmet detector. Either an Ultralytics model you trained (helmet.pt) or the
-    # Darknet YOLOv3 helmet model from the Kaggle reference (cfg + weights + names).
-    helmet_model: str = "helmet.pt"
-    helmet_darknet_cfg: str = "yolov3-helmet.cfg"
-    helmet_darknet_weights: str = "yolov3-helmet.weights"
-    helmet_darknet_names: str = "helmet.names"
-    # Optional "person on two-wheeler" detector trained on the Kaggle
-    # detect-person-on-motorbike-or-scooter dataset (Ultralytics or Darknet).
-    rider_model: str = "rider.pt"
-    rider_darknet_cfg: str = "yolov3_pb.cfg"
-    rider_darknet_weights: str = "yolov3-obj_final.weights"
-    rider_darknet_names: str = "rider.names"
-    # Optional number-plate detector (no plate data in the reference dataset).
-    plate_model: str = "plate.pt"
-    enable_plate_ocr: bool = True  # only used if a plate model AND easyocr are available
+    # --- inference --------------------------------------------------------------------------
+    confidence_threshold: float = Field(0.40, ge=0.01, le=0.99)
+    iou_threshold: float = Field(0.45, ge=0.05, le=0.95)
+    device: str = "auto"  # auto -> CUDA if available, else CPU
+    image_size: int = 640
+    max_side: int = 1280  # larger inputs are downscaled before inference
 
-    inference_imgsz: int = 640
-    device: str = "cpu"  # "cpu", "0" for first CUDA GPU, "mps" on Apple silicon
+    # --- confidence bands (UI + rule engine) --------------------------------------------------
+    high_confidence: float = 0.85
+    medium_confidence: float = 0.65
+    min_violation_confidence: float = 0.50  # below this a finding becomes "insufficient evidence"
+    min_association_score: float = 0.60  # person <-> two-wheeler "rider" link
+    weak_association_score: float = 0.40
 
-    # ------------------------------------------------------- detection filters
-    # Raw detections below these confidences are discarded before reasoning.
-    min_conf_vehicle: float = 0.35
-    min_conf_person: float = 0.35
-    min_conf_helmet: float = 0.30
-    min_conf_rider: float = 0.35
-    min_conf_traffic_light: float = 0.30
-    nms_iou: float = 0.5
-    duplicate_iou: float = 0.7  # same-class boxes overlapping more than this are merged
+    # --- video ------------------------------------------------------------------------------
+    video_frame_skip: int = Field(2, ge=1)  # analyse every Nth frame
+    video_min_violation_frames: int = Field(3, ge=1)  # temporal validation
+    video_max_seconds: int = 120
 
-    # ---------------------------------------------------- relationship analysis
-    rider_association_min: float = 0.50  # person <-> motorcycle score to count as a rider
-    rider_association_strong: float = 0.62  # required for every rider in a triple-riding call
-    head_region_ratio: float = 0.30  # top fraction of the person box treated as head region
-    helmet_head_overlap_min: float = 0.30  # fraction of helmet box that must lie in head region
-    min_person_height_px: int = 48  # smaller riders are "insufficient evidence" for helmet checks
-    max_riders_allowed: int = 2  # MV Act s.128: driver + one pillion
-
-    # ------------------------------------------------------- confidence system
-    conf_high: float = 0.85
-    conf_medium: float = 0.65
-    report_min_confidence: float = 0.45  # below this -> "insufficient visual evidence"
-
-    # ---------------------------------------------------------------- video
-    video_target_fps: float = 6.0  # frames analysed per second of footage (stride is derived)
-    video_max_seconds: float = 180.0  # longer clips are truncated for responsiveness
-    tracker: str = "bytetrack.yaml"  # or "botsort.yaml"
-    temporal_min_frames: int = 3  # a violation must be observed in at least this many frames
-    temporal_min_ratio: float = 0.6  # ...and in this share of frames where it could be evaluated
-    signal_smoothing_frames: int = 5  # majority vote window for traffic-light colour
-
-    # ---------------------------------------------------------------- uploads
-    max_image_mb: int = 20
-    max_video_mb: int = 300
+    # --- storage / server -------------------------------------------------------------------
+    database_url: str = ""  # empty -> sqlite in data/
+    data_dir: Path = ROOT_DIR / "data"
+    max_image_mb: int = 15
+    max_video_mb: int = 200
+    host: str = "127.0.0.1"
+    port: int = 8000
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    log_level: str = "INFO"
 
     @property
-    def uploads_dir(self) -> Path:
-        return self.data_dir / "uploads"
+    def db_file(self) -> Path:
+        if self.database_url.startswith("sqlite:///"):
+            p = Path(self.database_url.removeprefix("sqlite:///"))
+            return p if p.is_absolute() else ROOT_DIR / p
+        return self.data_dir / "trafficguard.db"
 
     @property
-    def results_dir(self) -> Path:
-        return self.data_dir / "results"
+    def rules_path(self) -> Path:
+        return APP_DIR / "rules" / "traffic_rules.json"
 
-    @property
-    def db_path(self) -> Path:
-        return self.data_dir / "history.sqlite3"
+    def helmet_names(self) -> set[str]:
+        return {n.strip().lower() for n in self.helmet_class_names.split(",") if n.strip()}
 
-    @property
-    def metrics_dir(self) -> Path:
-        return self.models_dir / "metrics"
-
-    def confidence_band(self, value: float) -> str:
-        if value >= self.conf_high:
-            return "high"
-        if value >= self.conf_medium:
-            return "medium"
-        return "low"
-
-    def ensure_dirs(self) -> None:
-        for d in (self.models_dir, self.data_dir, self.uploads_dir, self.results_dir, self.metrics_dir):
-            d.mkdir(parents=True, exist_ok=True)
-
-    def public_thresholds(self) -> dict:
-        """Thresholds exposed to the UI (Settings / About page)."""
-        keys = [
-            "min_conf_vehicle", "min_conf_person", "min_conf_helmet", "min_conf_rider",
-            "rider_association_min", "rider_association_strong", "head_region_ratio",
-            "helmet_head_overlap_min", "min_person_height_px", "max_riders_allowed",
-            "conf_high", "conf_medium", "report_min_confidence", "video_target_fps",
-            "temporal_min_frames", "temporal_min_ratio", "tracker", "inference_imgsz", "device",
-        ]
-        return {k: getattr(self, k) for k in keys}
+    def no_helmet_names(self) -> set[str]:
+        return {n.strip().lower() for n in self.no_helmet_class_names.split(",") if n.strip()}
 
 
 @lru_cache
 def get_settings() -> Settings:
-    s = Settings()
-    s.ensure_dirs()
-    return s
+    return Settings()

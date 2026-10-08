@@ -1,158 +1,200 @@
-"""Relationship analysis: which people are riding which two-wheeler, and is there a
-helmet on each rider's head?
+"""Relationship analysis: which persons ride which two-wheeler, and do they wear helmets?
 
-Object detection alone only says "there is a person" and "there is a motorcycle".
-A traffic rule is about the *relationship* between them, so this module turns raw
-boxes into ``TwoWheelerUnit`` objects using transparent geometric heuristics. Each
-heuristic is documented in docs/methodology.md.
-
-Coordinate convention: image pixels, origin top-left, y grows downwards.
+Everything here is plain geometry on bounding boxes (documented in docs/methodology.md). The goal is to
+avoid the naive "person detected + helmet not detected = violation" shortcut: a person only counts as a
+rider if they are positioned *on* a two-wheeler.
 """
-
 from __future__ import annotations
 
 from app.config import Settings
-from app.detection.types import Box, Detection, RiderAssessment, TwoWheelerUnit
+from app.detection.types import Box, Detection, RiderLink, TwoWheelerUnit
+
+# ---------------------------------------------------------------------------- box helpers
+
+def area(b: Box) -> float:
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
 
 
-def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, v))
+def inter(a: Box, b: Box) -> float:
+    return area((max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])))
 
 
-def rider_association_score(person: Box, bike: Box) -> float:
-    """Score in [0, 1] for "this person is sitting on this two-wheeler".
-
-    A seated rider produces a characteristic layout:
-      1. Horizontal alignment – the person's centre lies over the bike's footprint.
-      2. Vertical layout – the head is above the top of the bike box, while the hips/legs
-         end inside the bike box (people standing *beside* a bike have their feet at or
-         below the bike's bottom edge and are usually horizontally offset).
-      3. Overlap – a meaningful share of the person box overlaps the bike box.
-      4. Scale – person and bike have plausible relative sizes (rejects a distant
-         pedestrian that happens to line up behind a nearby bike).
-    The four cues are combined multiplicatively-ish so that one clearly failing cue
-    vetoes the association.
-    """
-    if person.area <= 0 or bike.area <= 0:
-        return 0.0
-
-    # 1. horizontal: share of the person's width that overlaps the bike's x-range (slightly widened)
-    wide = bike.expand(0.10, 0.0)
-    x_overlap = max(0.0, min(person.x2, wide.x2) - max(person.x1, wide.x1)) / person.w
-    centre_inside = wide.x1 <= person.cx <= wide.x2
-    horizontal = x_overlap if centre_inside else x_overlap * 0.3
-
-    # 2. vertical: person bottom should fall within the bike's vertical extent
-    #    (from 25% down the bike box to a little below its bottom edge) ...
-    lo, hi = bike.y1 + 0.25 * bike.h, bike.y2 + 0.10 * bike.h
-    if lo <= person.y2 <= hi:
-        bottom = 1.0
-    else:
-        dist = (lo - person.y2) if person.y2 < lo else (person.y2 - hi)
-        bottom = _clamp(1.0 - dist / (0.5 * bike.h))
-    #    ... and the person's top (head) should be above the middle of the bike box.
-    top = 1.0 if person.y1 <= bike.y1 + 0.35 * bike.h else _clamp(1.0 - (person.y1 - (bike.y1 + 0.35 * bike.h)) / (0.4 * bike.h))
-    vertical = bottom * top
-
-    # 3. overlap of the person box with the bike box
-    overlap = person.intersection(bike) / person.area
-    overlap_score = _clamp(overlap / 0.30)  # 30% or more overlap counts as full evidence
-
-    # 4. scale plausibility (person height relative to bike height)
-    ratio = person.h / bike.h
-    scale = 1.0 if 0.6 <= ratio <= 3.2 else _clamp(1.0 - abs(ratio - (0.6 if ratio < 0.6 else 3.2)) / 1.0)
-
-    score = (horizontal ** 0.7) * vertical * (0.4 + 0.6 * overlap_score) * scale
-    return round(_clamp(score), 4)
+def iou(a: Box, b: Box) -> float:
+    i = inter(a, b)
+    u = area(a) + area(b) - i
+    return i / u if u > 0 else 0.0
 
 
-def head_region(person: Box, ratio: float) -> Box:
-    """Approximate head region: top ``ratio`` of the person box, slightly widened."""
-    h = person.h * ratio
-    pad_x = person.w * 0.10
-    return Box(person.x1 - pad_x, person.y1 - 0.10 * h, person.x2 + pad_x, person.y1 + h)
+def iomin(a: Box, b: Box) -> float:
+    """Intersection over the smaller box - robust when one box contains the other."""
+    m = min(area(a), area(b))
+    return inter(a, b) / m if m > 0 else 0.0
 
 
-def helmet_in_head(helmet: Box, head: Box, min_overlap: float) -> float:
-    """Return the share of the helmet box inside the head region (0 if below threshold)."""
-    if helmet.area <= 0:
-        return 0.0
-    share = helmet.intersection(head) / helmet.area
-    centre_ok = head.x1 <= helmet.cx <= head.x2 and head.y1 <= helmet.cy <= head.y2
-    if share >= min_overlap and centre_ok:
-        return share
-    return 0.0
+def center(b: Box) -> tuple[float, float]:
+    return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
 
 
-def build_two_wheeler_units(detections: list[Detection], s: Settings) -> list[TwoWheelerUnit]:
-    """Associate people with motorcycles (one person -> at most one motorcycle)."""
-    bikes = [d for d in detections if d.label == "motorcycle"]
-    people = [d for d in detections if d.label == "person"]
-    rider_boxes = [d for d in detections if d.label == "rider"]
+# ---------------------------------------------------------------------------- duplicate filtering
 
-    units = [TwoWheelerUnit(vehicle=b) for b in bikes]
-    # A dedicated "person on two-wheeler" model (Kaggle reference dataset) supports the bike.
-    for u in units:
-        u.supported_by_rider_model = any(r.box.intersection(u.vehicle.box) / max(u.vehicle.box.area, 1) > 0.5
-                                         for r in rider_boxes)
+def dedupe(dets: list[Detection], iou_thr: float = 0.7) -> list[Detection]:
+    """Drop near-identical boxes of the same label (keeps the most confident one)."""
+    kept: list[Detection] = []
+    for d in sorted(dets, key=lambda x: -x.confidence):
+        if any(k.label == d.label and iou(k.box, d.box) > iou_thr for k in kept):
+            continue
+        kept.append(d)
+    return kept
 
-    for p in people:
-        best_unit, best_score = None, 0.0
+
+# ---------------------------------------------------------------------------- units
+
+def build_units(dets: list[Detection], s: Settings) -> list[TwoWheelerUnit]:
+    """Fuse COCO motorcycle/bicycle boxes with rider-model boxes into two-wheeler units and attach persons."""
+    bikes = [d for d in dets if d.label == "motorcycle"]
+    cycles = [d for d in dets if d.label == "bicycle"]
+    riders = [d for d in dets if d.label == "rider_unit"]
+    persons = [d for d in dets if d.label == "person"]
+
+    units: list[TwoWheelerUnit] = []
+    uid = 1
+    for b in bikes:
+        units.append(TwoWheelerUnit(uid, b.box, b.confidence, "motorcycle", "coco", track_id=b.track_id))
+        uid += 1
+    for r in riders:
+        # Does this person+bike box correspond to a COCO motorcycle we already have?
+        match = None
         for u in units:
-            score = rider_association_score(p.box, u.vehicle.box)
-            # Supporting evidence from the rider model: person inside a rider box.
-            if score > 0 and any(p.box.intersection(r.box) / p.box.area > 0.6 and
-                                 r.box.intersection(u.vehicle.box) > 0 for r in rider_boxes):
-                score = min(1.0, score + 0.15)
-            if score > best_score:
-                best_unit, best_score = u, score
-        if best_unit is not None and best_score >= s.rider_association_min:
-            best_unit.riders.append(RiderAssessment(person=p, association=best_score))
+            if u.kind == "motorcycle" and u.rider_box is None and iomin(u.bike_box, r.box) > 0.6:
+                match = u
+                break
+        if match is not None:
+            match.rider_box = r.box
+            match.origin = "both"
+            match.bike_conf = max(match.bike_conf, r.confidence) if match.bike_conf < 0.5 else match.bike_conf
+        else:
+            # Rider model only: the lower ~60% of a "person_bike" box is the machine.
+            x1, y1, x2, y2 = r.box
+            bike_box = (x1, y1 + 0.40 * (y2 - y1), x2, y2)
+            units.append(TwoWheelerUnit(uid, bike_box, r.confidence, "motorcycle", "rider_model", rider_box=r.box))
+            uid += 1
+    for c in cycles:
+        # Bicycles are counted but never evaluated against motorcycle rules.
+        if not any(u.kind == "motorcycle" and iomin(u.bike_box, c.box) > 0.7 for u in units):
+            units.append(TwoWheelerUnit(uid, c.box, c.confidence, "bicycle", "coco", track_id=c.track_id))
+            uid += 1
 
-    for u in units:
-        u.riders.sort(key=lambda r: r.person.box.cx)
+    _attach_persons(units, persons, s)
     return units
 
 
-def assess_helmets(units: list[TwoWheelerUnit], detections: list[Detection], s: Settings,
-                   helmet_model_available: bool, image_height: int) -> None:
-    """Fill in ``RiderAssessment.status`` for every rider of every unit (in place)."""
-    helmets = [d for d in detections if d.label == "helmet"]
-    no_helmets = [d for d in detections if d.label == "no_helmet"]
+def association_score(p: Detection, u: TwoWheelerUnit) -> float:
+    """0..1 score that person `p` is sitting on two-wheeler `u`."""
+    bx1, by1, bx2, by2 = u.bike_box
+    bw, bh = max(1.0, bx2 - bx1), max(1.0, by2 - by1)
+    # rider region: the machine plus the space above it where the body sits
+    region = (bx1 - 0.10 * bw, by1 - 1.3 * bh, bx2 + 0.10 * bw, by2 + 0.10 * bh)
+    pa = max(1.0, area(p.box))
+    overlap = inter(p.box, region) / pa
 
+    pcx, _ = center(p.box)
+    half = 0.5 * bw
+    dx = 0.0 if bx1 <= pcx <= bx2 else min(abs(pcx - bx1), abs(pcx - bx2))
+    horiz = max(0.0, 1.0 - dx / max(1.0, half))
+
+    # seated riders: lower body reaches into the machine box; standing bystanders usually end below/away
+    vertical = 1.0 if (by1 + 0.15 * bh) <= p.box[3] <= (by2 + 0.15 * bh) else 0.0
+    # sane scale: rider height is comparable to the machine height
+    ratio = p.height / bh
+    scale = 1.0 if 0.7 <= ratio <= 2.8 else 0.0
+
+    if u.rider_box is not None:
+        contain = inter(p.box, u.rider_box) / pa
+        score = 0.30 * overlap + 0.20 * horiz + 0.15 * vertical + 0.10 * scale + 0.25 * contain
+    else:
+        score = 0.40 * overlap + 0.25 * horiz + 0.20 * vertical + 0.15 * scale
+    return float(max(0.0, min(1.0, score)))
+
+
+def _attach_persons(units: list[TwoWheelerUnit], persons: list[Detection], s: Settings) -> None:
+    motor = [u for u in units if u.kind == "motorcycle"]
+    if not motor:
+        return
+    for p in persons:
+        scored = [(association_score(p, u), u) for u in motor]
+        score, best = max(scored, key=lambda t: t[0])
+        if score >= s.min_association_score:
+            best.riders.append(RiderLink(p, score, True))
+        elif score >= s.weak_association_score:
+            best.weak_links.append(RiderLink(p, score, False))
+    for u in motor:
+        # the front-most/largest person is the driver, everyone else is a pillion
+        u.riders.sort(key=lambda r: -area(r.person.box))
+        _demote_inconsistent(u, s)
+        for i, r in enumerate(u.riders):
+            r.role = "rider" if i == 0 else "pillion"
+
+
+def _demote_inconsistent(u: TwoWheelerUnit, s: Settings) -> None:
+    """A pillion sits at the same depth as the driver and inside the machine's footprint.
+
+    People far behind the bike (much smaller in the image than the driver) or at its very edge are
+    background pedestrians or riders of *other* bikes in a convoy: demote them to ambiguous.
+    """
+    if len(u.riders) < 2:
+        return
+    driver = u.riders[0].person
+    dh, da = max(1.0, driver.height), max(1.0, area(driver.box))
+    bx1, _, bx2, _ = u.bike_box
+    margin = 0.10 * (bx2 - bx1)
+    keep = [u.riders[0]]
+    for r in u.riders[1:]:
+        cx = center(r.person.box)[0]
+        same_depth = area(r.person.box) >= 0.25 * da and r.person.height >= 0.5 * dh
+        inside = (bx1 + margin) <= cx <= (bx2 - margin)
+        if same_depth and inside:
+            keep.append(r)
+        else:
+            r.strong = False
+            u.weak_links.append(r)
+    u.riders = keep
+
+
+# ---------------------------------------------------------------------------- helmets
+
+def head_region(person: Box) -> Box:
+    x1, y1, x2, y2 = person
+    w, h = x2 - x1, y2 - y1
+    return (x1 - 0.10 * w, y1 - 0.05 * h, x2 + 0.10 * w, y1 + 0.30 * h)
+
+
+def assess_helmets(units: list[TwoWheelerUnit], dets: list[Detection], helmet_model_loaded: bool, s: Settings) -> None:
+    """Fill `helmet_status` on every strongly-associated rider.
+
+    No helmet model -> `not_assessed` (we refuse to guess). With a model: a helmet box in the head region
+    -> `helmet`; an explicit no-helmet box -> `no_helmet`; neither -> `no_helmet_inferred` (weaker evidence);
+    head cut off by the image border or too small to judge -> `unknown`.
+    """
+    helmets = [d for d in dets if d.label == "helmet"]
+    bares = [d for d in dets if d.label == "no_helmet"]
     for u in units:
         for r in u.riders:
-            pbox = r.person.box
-            head = head_region(pbox, s.head_region_ratio)
-
-            if not helmet_model_available:
-                r.status, r.reason = "not_evaluated", "No helmet detection model is loaded"
+            if not helmet_model_loaded:
+                r.helmet_status, r.helmet_confidence = "not_assessed", 0.0
                 continue
-            if pbox.h < s.min_person_height_px:
-                r.status = "insufficient_evidence"
-                r.reason = f"Rider too small to judge ({int(pbox.h)} px tall)"
+            hr = head_region(r.person.box)
+            head_h = hr[3] - hr[1]
+            if head_h < 14:
+                r.helmet_status = "unknown"
                 continue
-            if pbox.y1 <= 2 and pbox.h < image_height * 0.9:
-                r.status, r.reason = "insufficient_evidence", "Rider's head is cut off by the frame edge"
-                continue
-
-            matched_helmet = max(((h, helmet_in_head(h.box, head, s.helmet_head_overlap_min)) for h in helmets),
-                                 key=lambda t: (t[1] > 0, t[0].confidence), default=(None, 0.0))
-            matched_no = max(((n, helmet_in_head(n.box, head, s.helmet_head_overlap_min)) for n in no_helmets),
-                             key=lambda t: (t[1] > 0, t[0].confidence), default=(None, 0.0))
-            # Weak helmet boxes near (not exactly on) the head reduce confidence in an absence call.
-            near = head.expand(0.5)
-            r.max_nearby_helmet_conf = max((h.confidence for h in helmets if h.box.intersection(near) > 0), default=0.0)
-
-            if matched_helmet[0] is not None and matched_helmet[1] > 0:
-                r.helmet = matched_helmet[0]
-                if matched_no[0] is not None and matched_no[1] > 0 and matched_no[0].confidence > r.helmet.confidence:
-                    r.no_helmet = matched_no[0]
-                    r.status, r.reason = "no_helmet", "Bare head detected on rider (stronger than helmet detection)"
-                else:
-                    r.status, r.reason = "helmet", "Helmet detected in rider's head region"
-            elif matched_no[0] is not None and matched_no[1] > 0:
-                r.no_helmet = matched_no[0]
-                r.status, r.reason = "no_helmet", "Bare head detected in rider's head region"
+            h_hit = max((d for d in helmets if iomin(d.box, hr) > 0.4 and center(d.box)[1] < hr[3]),
+                        key=lambda d: d.confidence, default=None)
+            n_hit = max((d for d in bares if iomin(d.box, hr) > 0.4), key=lambda d: d.confidence, default=None)
+            if h_hit and (not n_hit or h_hit.confidence >= n_hit.confidence):
+                r.helmet_status, r.helmet_confidence = "helmet", h_hit.confidence
+            elif n_hit:
+                r.helmet_status, r.helmet_confidence = "no_helmet", n_hit.confidence
             else:
-                r.status, r.reason = "no_helmet", "Helmet not detected in rider's head region"
+                # absence of a detection is weak evidence; confidence is deliberately damped
+                r.helmet_status = "no_helmet_inferred"
+                r.helmet_confidence = round(0.7 * r.person.confidence * r.score, 4)

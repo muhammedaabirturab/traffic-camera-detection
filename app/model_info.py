@@ -1,87 +1,41 @@
-"""Builds the Model Information page data from the files actually on disk.
-
-Metrics are never hard-coded: they are read from ``models/metrics/<name>.json``,
-which ``scripts/train.py`` / ``scripts/validate.py`` write after running Ultralytics
-validation on the held-out split. If no such file exists, the page states that the
-model is not trained / metrics are unavailable.
-"""
-
+"""Model page data. Metrics are READ from files written by scripts/train.py - never hard-coded."""
 from __future__ import annotations
 
 import json
-import platform
-from pathlib import Path
 
 from app.config import Settings
-from app.detection.yolo_detector import ModelManager
-
-ROLE_DESCRIPTIONS = {
-    "vehicle": "General traffic detector (COCO-pretrained): vehicles, persons, traffic lights",
-    "helmet": "Helmet / bare-head detector used for the helmet rule",
-    "rider": "Person-on-two-wheeler detector (Kaggle reference dataset); supporting evidence for rider association",
-    "plate": "Optional number-plate detector for AI-generated plate readings",
-}
+from app.detection.yolo_detector import YoloDetector
 
 
-def load_metrics(metrics_dir: Path) -> list[dict]:
-    out = []
-    for p in sorted(Path(metrics_dir).glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-            data["_file"] = p.name
-            out.append(data)
-        except (OSError, json.JSONDecodeError):
-            continue
-    return out
-
-
-def model_info(s: Settings, models: ModelManager) -> dict:
-    models.load()
-    status = models.status()
-    metrics = load_metrics(s.metrics_dir)
-    by_weights = {m.get("weights_name"): m for m in metrics}
-
-    detectors = []
-    for role, st in status.items():
-        entry = {"role": role, "description": ROLE_DESCRIPTIONS[role], **st}
-        m = by_weights.get(st.get("weights"))
-        if m is None and role != "vehicle":
-            m = next((x for x in metrics if x.get("role") == role), None)
-        entry["trained_metrics"] = m
-        if role == "vehicle":
-            entry["provenance"] = ("Official Ultralytics COCO-pretrained weights. Not re-evaluated on project data, "
-                                   "so no project-specific metrics are shown for this model.")
-        elif not st["available"]:
-            entry["provenance"] = "Model not trained / not installed — metrics unavailable."
-        elif m is None:
-            entry["provenance"] = ("Model file present but no metrics file found in models/metrics — run "
-                                   "scripts/validate.py to measure it. Metrics unavailable.")
-        else:
-            entry["provenance"] = "Metrics measured on the held-out split by scripts/train.py / scripts/validate.py."
-        detectors.append(entry)
-
+def read_metrics(s: Settings) -> dict | None:
+    f = s.model_path.with_suffix(".metrics.json")
+    if not f.exists():
+        return None
     try:
-        import torch
-        cuda = torch.cuda.is_available()
-        accel = torch.cuda.get_device_name(0) if cuda else "CPU"
-        torch_version = torch.__version__
-    except Exception:  # pragma: no cover
-        accel, torch_version = "unknown", None
-    try:
-        import ultralytics
-        ul_version = ultralytics.__version__
-    except Exception:  # pragma: no cover
-        ul_version = None
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
+
+def model_info(detector: YoloDetector | None, s: Settings) -> dict:
+    metrics = read_metrics(s)
+    status = detector.status() if detector else None
     return {
-        "framework": "Ultralytics YOLO" + (f" {ul_version}" if ul_version else ""),
-        "task": "Object detection",
-        "inputs": ["Image (JPG/PNG)", "Video (MP4/AVI/MOV)"],
-        "inference_imgsz": s.inference_imgsz,
-        "device_setting": s.device,
-        "runtime": {"python": platform.python_version(), "torch": torch_version, "accelerator": accel},
-        "tracker": s.tracker.replace(".yaml", ""),
-        "detectors": detectors,
-        "training_runs": metrics,
-        "trained": any(m for m in metrics),
+        "framework": "Ultralytics YOLO",
+        "task": "Object detection (+ rule-based traffic inference)",
+        "input": "Image (JPG/PNG) / Video (MP4/AVI/MOV)",
+        "dataset": "Motorbike / rider traffic dataset (single class: person_bike). No helmet labels.",
+        "models": status,
+        "metrics_available": metrics is not None,
+        "metrics": metrics,
+        "metrics_message": None if metrics else "Model not trained / metrics unavailable. Run scripts/train.py to generate real metrics.",
+        "helmet_model": bool(detector and detector.helmet_available),
+        "config": {
+            "confidence_threshold": s.confidence_threshold, "iou_threshold": s.iou_threshold,
+            "image_size": s.image_size, "device": status["device"] if status else s.device,
+            "video_frame_skip": s.video_frame_skip, "video_min_violation_frames": s.video_min_violation_frames,
+            "confidence_bands": {"high": s.high_confidence, "medium": s.medium_confidence},
+            "min_violation_confidence": s.min_violation_confidence,
+            "min_association_score": s.min_association_score,
+        },
     }

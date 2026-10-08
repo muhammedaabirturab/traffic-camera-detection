@@ -1,60 +1,54 @@
-"""Minimal background job runner for long video analyses.
-
-Video analysis on a laptop CPU can take minutes, so the API returns a job id
-immediately and the dashboard polls ``GET /api/jobs/{id}`` for progress. One worker
-thread is used because inference is CPU/GPU bound; additional jobs queue up.
-"""
-
+"""Background execution of video analyses (one at a time - the GPU/CPU is the bottleneck)."""
 from __future__ import annotations
 
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Callable
 
-from app.utils.helpers import new_id, utc_now_iso
+from app.detection.preprocessing import InvalidInputError
+from app.detection.yolo_detector import InferenceError
 
 log = logging.getLogger(__name__)
 
 
 class JobManager:
-    def __init__(self, workers: int = 1):
-        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tg-job")
-        self._jobs: dict[str, dict[str, Any]] = {}
-        self._lock = threading.Lock()
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video")
+        self.jobs: dict[str, dict] = {}
+        self.lock = threading.Lock()
 
-    def submit(self, fn: Callable[[Callable[[float, str], None]], Any], analysis_id: str,
-               on_error: Optional[Callable[[str], None]] = None) -> str:
-        job_id = new_id()
-        with self._lock:
-            self._jobs[job_id] = {"job_id": job_id, "analysis_id": analysis_id, "status": "queued",
-                                  "progress": 0.0, "message": "Queued", "created_at": utc_now_iso(), "error": None}
+    def submit(self, job_id: str, filename: str, work: Callable[[Callable[[float], None]], dict],
+               on_done: Callable[[dict], None], cleanup: Path | None = None) -> None:
+        with self.lock:
+            self.jobs[job_id] = {"id": job_id, "status": "queued", "progress": 0.0, "filename": filename, "error": None}
 
-        def progress(fraction: float, message: str) -> None:
-            with self._lock:
-                self._jobs[job_id].update(progress=round(float(fraction), 3), message=message, status="running")
+        def progress(p: float) -> None:
+            with self.lock:
+                self.jobs[job_id].update(status="running", progress=round(p, 3))
 
-        def run():
+        def run() -> None:
             try:
-                progress(0.0, "Starting")
-                fn(progress)
-                with self._lock:
-                    self._jobs[job_id].update(status="completed", progress=1.0, message="Completed")
-            except Exception as exc:  # reported to the client, logged with traceback
-                log.exception("Job %s failed", job_id)
-                with self._lock:
-                    self._jobs[job_id].update(status="failed", message="Failed", error=str(exc))
-                if on_error:
-                    on_error(str(exc))
+                progress(0.0)
+                result = work(progress)
+                on_done(result)
+                with self.lock:
+                    self.jobs[job_id].update(status="done", progress=1.0, result_id=result["id"])
+            except (InvalidInputError, InferenceError) as exc:
+                with self.lock:
+                    self.jobs[job_id].update(status="error", error=str(exc))
+            except Exception:  # never leak a traceback to the UI
+                log.exception("Video job %s failed", job_id)
+                with self.lock:
+                    self.jobs[job_id].update(status="error", error="Video analysis failed unexpectedly. Check the server log.")
+            finally:
+                if cleanup is not None:
+                    cleanup.unlink(missing_ok=True)
 
-        self._pool.submit(run)
-        return job_id
+        self.pool.submit(run)
 
-    def get(self, job_id: str) -> Optional[dict]:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            return dict(job) if job else None
-
-    def active(self) -> list[dict]:
-        with self._lock:
-            return [dict(j) for j in self._jobs.values() if j["status"] in {"queued", "running"}]
+    def get(self, job_id: str) -> dict | None:
+        with self.lock:
+            j = self.jobs.get(job_id)
+            return dict(j) if j else None

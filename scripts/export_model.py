@@ -1,35 +1,26 @@
-"""Export a trained YOLO model for deployment (ONNX, TorchScript, OpenVINO, ...).
+"""Export trained weights to a deployment format (ONNX by default).
 
-python scripts/export_model.py --weights models/rider.pt --format onnx
-python scripts/export_model.py --weights models/helmet.pt --format openvino --half
-
-The exported file is written next to the weights. The API itself uses the .pt files;
-exports are for deployment on edge devices / other runtimes.
+    python scripts/export_model.py --weights app/models/rider_detector.pt --format onnx
 """
-
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-import _metrics  # noqa: F401  (adds project root to sys.path)
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def main() -> int:
+def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", required=True, type=Path)
-    ap.add_argument("--format", default="onnx", help="onnx, torchscript, openvino, engine, coreml, tflite ...")
+    ap.add_argument("--weights", type=Path, default=ROOT / "app" / "models" / "rider_detector.pt")
+    ap.add_argument("--format", default="onnx", help="onnx, torchscript, openvino, ...")
     ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--half", action="store_true", help="FP16 (where supported)")
-    ap.add_argument("--dynamic", action="store_true", help="dynamic input shapes (ONNX/TensorRT)")
     args = ap.parse_args()
-
+    if not args.weights.exists():
+        raise SystemExit(f"{args.weights} not found. Train first: python scripts/train.py")
     from ultralytics import YOLO
-
-    path = YOLO(str(args.weights)).export(format=args.format, imgsz=args.imgsz, half=args.half, dynamic=args.dynamic)
-    print(f"Exported: {path}")
-    return 0
+    print("Exported to:", YOLO(str(args.weights)).export(format=args.format, imgsz=args.imgsz))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

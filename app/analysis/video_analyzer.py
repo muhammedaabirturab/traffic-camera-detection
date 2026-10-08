@@ -1,263 +1,290 @@
-"""Video analysis: YOLO detection + ByteTrack/BoT-SORT tracking + temporal validation.
-
-Frames are sampled at ``Settings.video_target_fps`` (e.g. 6 analysed frames per second
-of footage), each sampled frame goes through the same per-frame reasoning as an image,
-and the ``TemporalAggregator`` only confirms violations that persist across frames for
-the same tracked vehicle / rider. An annotated H.264 MP4 is written for playback in the
-browser.
-"""
-
+"""Video analysis: YOLO + ByteTrack, temporal validation, evidence frames and an annotated output video."""
 from __future__ import annotations
 
-import logging
 import time
-from dataclasses import replace
-from pathlib import Path
+from collections import defaultdict
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import cv2
 import numpy as np
 
-from app.analysis.evidence_generator import EvidenceWriter
-from app.analysis.image_analyzer import DISCLAIMER, attach_plate, model_flags
+from app.analysis.evidence_generator import save_evidence
+from app.analysis.pipeline import analyze_frame
 from app.config import Settings
-from app.detection.preprocessing import enhance_low_light, limit_size
-from app.detection.signal import SignalStateEstimator
-from app.detection.tracker import TemporalAggregator
-from app.detection.types import VEHICLE_LABELS, Box, Observation
-from app.detection.violation_detector import analyse_frame, rider_summary
-from app.detection.yolo_detector import ModelManager, deduplicate
-from app.rules.rule_engine import RuleEngine
-from app.utils import visualization as viz
+from app.detection.preprocessing import InvalidInputError, resize_max_side
+from app.detection.tracker import IoUTracker
+from app.detection.types import Finding, TwoWheelerUnit
+from app.detection.yolo_detector import YoloDetector
+from app.rules.rule_engine import DISCLAIMER, RuleEngine
+from app.utils.helpers import format_timestamp, utc_now
+from app.utils.video_io import VideoWriter
+from app.utils.visualization import draw_overlay
 
-log = logging.getLogger(__name__)
-ProgressFn = Callable[[float, str], None]
-MAX_VIDEO_SIDE = 1280
+VEHICLES = ("car", "bus", "truck", "motorcycle", "bicycle")
 
 
-class InvalidVideoError(ValueError):
-    pass
+@dataclass
+class VideoOptions:
+    """Operator-supplied context for the experimental red-light rule (the model cannot see signal state)."""
+    stop_line: Optional[float] = None  # 0..1 of frame height
+    red_from: Optional[float] = None   # seconds
+    red_to: Optional[float] = None
+    direction: str = "down"            # direction of travel across the line: down | up
 
 
-class _VideoWriter:
-    """H.264 writer via imageio-ffmpeg (plays in browsers); falls back to OpenCV mp4v."""
-
-    def __init__(self, path: Path, width: int, height: int, fps: float):
-        self.path = path
-        self.browser_playable = True
-        self._gen = None
-        self._cv = None
-        try:
-            import imageio_ffmpeg
-
-            self._gen = imageio_ffmpeg.write_frames(str(path), (width, height), fps=max(1.0, fps), codec="libx264",
-                                                    pix_fmt_in="bgr24", pix_fmt_out="yuv420p", quality=6,
-                                                    macro_block_size=2, ffmpeg_log_level="error",
-                                                    output_params=["-movflags", "+faststart"])
-            self._gen.send(None)
-        except Exception:
-            log.warning("imageio-ffmpeg unavailable, falling back to OpenCV mp4v (may not play in browsers)")
-            self._gen = None
-            self.browser_playable = False
-            self._cv = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps), (width, height))
-
-    def write(self, frame: np.ndarray) -> None:
-        if self._gen is not None:
-            self._gen.send(np.ascontiguousarray(frame))
-        elif self._cv is not None:
-            self._cv.write(frame)
-
-    def close(self) -> None:
-        if self._gen is not None:
-            self._gen.close()
-        if self._cv is not None:
-            self._cv.release()
+@dataclass
+class _Track:
+    hits: int = 0
+    seen: int = 0
+    first_idx: int = 0
+    last_idx: int = 0
+    best_conf: float = 0.0
+    best_violation: Optional[dict] = None
+    best_crop: Optional[np.ndarray] = None
+    best_idx: int = 0
+    immediate: bool = False  # events that are temporal by nature (stop-line crossing)
 
 
-def _even(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-    return img[: h - h % 2, : w - w % 2]
+def analyze_video(path: str, analysis_id: str, filename: str, detector: YoloDetector, rules: RuleEngine,
+                  s: Settings, opts: VideoOptions, progress: Callable[[float], None] = lambda p: None) -> dict:
+    t0 = time.perf_counter()
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise InvalidInputError("The video could not be opened - it may be corrupted or use an unsupported codec.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if fps <= 0 or fps > 240:
+        fps = 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    max_frames = int(s.video_max_seconds * fps)
+    truncated = total > max_frames > 0
+    n_target = min(total, max_frames) if total > 0 else max_frames
+
+    media_dir = s.data_dir / "media" / analysis_id
+    media_dir.mkdir(parents=True, exist_ok=True)
+    out_path = media_dir / "processed.mp4"
+
+    detector.reset_tracking()
+    unit_tracker = IoUTracker()
+    writer: Optional[VideoWriter] = None
+    tracks: dict[tuple, _Track] = defaultdict(_Track)
+    unit_seen: dict[int, int] = defaultdict(int)
+    veh_ids: dict[str, dict[int, int]] = {k: defaultdict(int) for k in VEHICLES}  # label -> track -> appearances
+    prev_y: dict[int, float] = {}
+    hits_by_sec: dict[int, set] = defaultdict(set)
+    conf_sum, conf_n, veh_detections = 0.0, 0, 0
+    last_overlay: list[dict] = []
+    analyzed = idx = 0
+    size = (0, 0)
+    hr_h = hr_w = 0
+
+    try:
+        while idx < max_frames or total == 0:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame = resize_max_side(frame, s.max_side)
+            h, w = frame.shape[:2]
+            frame = frame[: h - h % 2, : w - w % 2]  # even dims for yuv420p
+            h, w = frame.shape[:2]
+            if writer is None:
+                size, hr_h, hr_w = (w, h), h, w
+                writer = VideoWriter(out_path, fps, size)
+            t = idx / fps
+
+            if idx % s.video_frame_skip == 0:
+                analyzed += 1
+                res = analyze_frame(frame, detector, rules, s, track=True)
+                last_overlay = res.overlay
+                _assign_unit_tracks(res.units, unit_tracker, idx)
+                # overlay track ids for rider-model-only units
+                for o in last_overlay:
+                    if o.get("unit_id") is not None and o["label"] in ("motorcycle", "bicycle"):
+                        u = next((u for u in res.units if u.unit_id == o["unit_id"]), None)
+                        if u is not None:
+                            o["track_id"] = u.track_id
+                for u in res.units:
+                    unit_seen[u.track_id] += 1
+                    veh_ids[u.kind][u.track_id] += 1
+                for d in res.detections:
+                    if d.label in ("car", "bus", "truck"):
+                        veh_detections += 1
+                        if d.track_id is not None:
+                            veh_ids[d.label][d.track_id] += 1
+                veh_detections += len(res.units)
+                for o in res.overlay:
+                    if not o.get("minor") and o["label"] not in ("rider", "pillion"):
+                        conf_sum += o["confidence"]
+                        conf_n += 1
+
+                annotated: Optional[np.ndarray] = None
+                for v in res.violations:
+                    key = (v["violation_id"], v["track_id"])
+                    tr = tracks[key]
+                    if tr.hits == 0:
+                        tr.first_idx = idx
+                    tr.seen = unit_seen[v["track_id"]]
+                    if v["status"] != "possible":
+                        continue
+                    tr.hits += 1
+                    tr.last_idx = idx
+                    hits_by_sec[int(t)].add(key)
+                    if v["confidence"] > tr.best_conf:
+                        if annotated is None:
+                            annotated = draw_overlay(frame, res.overlay)
+                        tr.best_conf, tr.best_violation, tr.best_idx = v["confidence"], v, idx
+                        tr.best_crop = annotated  # keep frame reference; cropped at the end
+                        tr.best_crop = _crop(annotated, v["box"])
+
+                if opts.stop_line is not None:
+                    _check_red_light(res, opts, t, idx, h, prev_y, tracks, rules, frame, hits_by_sec)
+                progress(min(0.99, idx / max(1, n_target)))
+
+            out_frame = draw_overlay(frame, last_overlay)
+            _hud(out_frame, idx, t, opts, h)
+            writer.write(out_frame)
+            idx += 1
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.close()
+
+    if analyzed == 0:
+        raise InvalidInputError("No readable frames were found in this video.")
+
+    # ---------------------------------------------------------------- temporal validation
+    violations: list[dict] = []
+    unconfirmed = 0
+    for n, (key, tr) in enumerate(sorted(tracks.items(), key=lambda kv: -kv[1].best_conf), 1):
+        if tr.best_violation is None:
+            continue
+        need = 1 if tr.immediate else s.video_min_violation_frames
+        if tr.hits < need or (not tr.immediate and tr.hits < 0.3 * max(1, tr.seen)):
+            unconfirmed += 1
+            continue
+        v = dict(tr.best_violation)
+        ev_name = f"evidence_{len(violations) + 1}.jpg"
+        crop_path = media_dir / ev_name
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(crop_path), tr.best_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        v.update({
+            "evidence_image": f"/media/{analysis_id}/{ev_name}",
+            "frame_number": tr.best_idx,
+            "timestamp": format_timestamp(tr.best_idx / fps),
+            "timestamp_seconds": round(tr.best_idx / fps, 2),
+            "first_seen": format_timestamp(tr.first_idx / fps),
+            "last_seen": format_timestamp(tr.last_idx / fps),
+            "frames_observed": tr.hits,
+            "evidence": v["evidence"] + (f" Observed in {tr.hits} analysed frames." if not tr.immediate else ""),
+            "_key": list(map(str, key)),
+        })
+        violations.append(v)
+    confirmed_keys = {tuple(v.pop("_key")) for v in violations}
+
+    # per-second timeline (confirmed violations only)
+    duration = idx / fps
+    timeline = []
+    for sec in range(int(duration) + 1):
+        active = {k for k in hits_by_sec.get(sec, set()) if tuple(map(str, k)) in confirmed_keys}
+        timeline.append({"second": sec, "violations": len(active)})
+
+    uniq = {k: sum(1 for c in ids.values() if c >= 2) or (len(ids) if k in ("motorcycle", "bicycle") else 0)
+            for k, ids in veh_ids.items()}
+    unique_total = sum(uniq.values())
+    avg = conf_sum / conf_n if conf_n else 0.0
+    risk_index = min(100.0, 100.0 * sum(v["confidence"] for v in violations) / max(1, unique_total))
+    notes = [f"Violations must persist for at least {s.video_min_violation_frames} analysed frames to be reported "
+             f"(every {s.video_frame_skip} frame(s) analysed)."]
+    if unconfirmed:
+        notes.append(f"{unconfirmed} short-lived candidate(s) were discarded by temporal validation.")
+    if truncated:
+        notes.append(f"Only the first {s.video_max_seconds} seconds were analysed.")
+    if not detector.helmet_available:
+        notes.append("No helmet model is installed, so helmet compliance was not assessed.")
+    if opts.stop_line is not None:
+        notes.append("Red-light check is experimental: stop line and red-phase window were supplied by the operator.")
+
+    return {
+        "status": "success", "id": analysis_id, "kind": "video", "filename": filename, "created_at": utc_now(),
+        "video": {"fps": round(fps, 2), "width": hr_w, "height": hr_h, "frames_total": idx, "frames_analyzed": analyzed,
+                  "duration_seconds": round(duration, 2), "frame_skip": s.video_frame_skip, "truncated": truncated},
+        "violations": sorted(violations, key=lambda v: v["timestamp_seconds"]),
+        "summary": {
+            "vehicles_detected": veh_detections, "unique_vehicles": unique_total,
+            "motorcycles": uniq["motorcycle"], "bicycles": uniq["bicycle"], "cars": uniq["car"],
+            "buses": uniq["bus"], "trucks": uniq["truck"],
+            "possible_violations": len(violations), "violation_types": sorted({v["violation_id"] for v in violations}),
+            "insufficient_evidence": unconfirmed,
+        },
+        "timeline": timeline,
+        "intelligence": {
+            "traffic_objects": unique_total, "normal_objects": max(0, unique_total - len(violations)),
+            "possible_violations": len(violations), "average_confidence": round(avg, 4),
+            "risk_index": round(risk_index, 1),
+            "risk_level": "LOW" if not violations else ("MODERATE" if risk_index < 50 else "HIGH"),
+            "note": "Analytical summary of AI detections only - not a legal judgment.",
+        },
+        "confidence": round(max((v["confidence"] for v in violations), default=avg), 4),
+        "processing_time": round(time.perf_counter() - t0, 2),
+        "media": {"processed_video": f"/media/{analysis_id}/processed.mp4"},
+        "notes": notes, "disclaimer": DISCLAIMER,
+    }
 
 
-class VideoAnalyzer:
-    def __init__(self, settings: Settings, models: ModelManager, rules: RuleEngine):
-        self.s = settings
-        self.models = models
-        self.rules = rules
+def _crop(annotated: np.ndarray, box) -> np.ndarray:
+    from app.utils.visualization import crop_with_padding
+    return crop_with_padding(annotated, box, pad=0.35)
 
-    def analyze(self, path: Path, filename: str, analysis_id: str, created_at: str,
-                stop_line: Optional[float] = None, line_direction: str = "any",
-                progress: Optional[ProgressFn] = None) -> dict:
-        s = self.s
-        progress = progress or (lambda f, m: None)
-        t0 = time.perf_counter()
-        self.models.load()
 
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise InvalidVideoError("Video could not be opened (unsupported codec or corrupt file)")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        if fps <= 1 or fps > 240:
-            fps = 25.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        max_frames = int(s.video_max_seconds * fps)
-        frames_to_read = min(total, max_frames) if total > 0 else max_frames
-        stride = max(1, int(round(fps / s.video_target_fps)))
-        truncated = total > max_frames
+def _assign_unit_tracks(units: list[TwoWheelerUnit], tracker: IoUTracker, idx: int) -> None:
+    missing = [u for u in units if u.track_id is None]
+    if missing:
+        for u, tid in zip(missing, tracker.update([u.box for u in missing], idx)):
+            u.track_id = tid
 
-        tracker = self.models.new_tracking_detector()
-        writer = EvidenceWriter(s.results_dir, analysis_id)
-        signal = SignalStateEstimator(s.signal_smoothing_frames)
-        aggregator: Optional[TemporalAggregator] = None
-        video_out: Optional[_VideoWriter] = None
-        timeline: list[dict] = []
-        per_frame_max_vehicles = 0
-        rider_peak = {"riders": 0}
-        first_frame: Optional[np.ndarray] = None
-        signal_seen = False
-        low_light_frames = 0
-        frame_size = None
 
-        idx = analysed = 0
-        progress(0.01, "Starting video analysis")
-        try:
-            while idx < frames_to_read:
-                ok = cap.grab()
-                if not ok:
-                    break
-                if idx % stride != 0:
-                    idx += 1
-                    continue
-                ok, frame = cap.retrieve()
-                if not ok or frame is None:
-                    idx += 1
-                    continue
-                frame = _even(limit_size(frame, MAX_VIDEO_SIDE))
-                frame, enhanced = enhance_low_light(frame)
-                low_light_frames += int(enhanced)
-                h, w = frame.shape[:2]
-                if frame_size is None:
-                    frame_size = (w, h)
-                    first_frame = frame.copy()
-                    line_px = stop_line * h if stop_line is not None else None
-                    aggregator = TemporalAggregator(s, line_px, line_direction)
-                    video_out = _VideoWriter(writer.dir / "processed.mp4", w, h, fps / stride)
-                elif (w, h) != frame_size:
-                    frame = cv2.resize(frame, frame_size)
+def _check_red_light(res, opts: VideoOptions, t: float, idx: int, h: int, prev_y: dict, tracks: dict,
+                     rules: RuleEngine, frame: np.ndarray, hits_by_sec: dict) -> None:
+    line = opts.stop_line * h
+    red = (opts.red_from is None or t >= opts.red_from) and (opts.red_to is None or t <= opts.red_to)
+    for d in res.detections:
+        if d.label not in ("car", "bus", "truck", "motorcycle") or d.track_id is None:
+            continue
+        y = d.box[3]
+        py = prev_y.get(d.track_id)
+        prev_y[d.track_id] = y
+        if py is None or not red:
+            continue
+        crossed = (py < line <= y) if opts.direction == "down" else (py > line >= y)
+        if not crossed:
+            continue
+        unit = TwoWheelerUnit(unit_id=d.track_id, bike_box=d.box, bike_conf=d.confidence,
+                              kind="motorcycle" if d.label == "motorcycle" else d.label, track_id=d.track_id)
+        f = Finding("red_light_jump", d.confidence, unit,
+                    f"Tracked {d.label} crossed the operator-defined stop line during the marked red phase.")
+        v = rules.finalize(f)
+        if v is None or v["status"] != "possible":
+            continue
+        key = ("red_light_jump", d.track_id)
+        tr = tracks[key]
+        if tr.hits == 0:
+            tr.first_idx = idx
+        tr.hits += 1
+        tr.last_idx, tr.immediate, tr.seen = idx, True, 1
+        hits_by_sec[int(t)].add(key)
+        if d.confidence >= tr.best_conf:
+            ann = draw_overlay(frame, [{"label": d.label, "confidence": d.confidence, "state": "violation",
+                                        "track_id": d.track_id, "box_norm": [d.box[0] / frame.shape[1], d.box[1] / h,
+                                                                             d.box[2] / frame.shape[1], d.box[3] / h]}])
+            tr.best_conf, tr.best_violation, tr.best_idx = d.confidence, v, idx
+            tr.best_crop = _crop(ann, v["box"])
 
-                ts = idx / fps
-                dets = self.models.filter_by_confidence(tracker.track(frame, s.tracker))
-                dets.extend(self.models.detect_auxiliary(frame))
-                dets = deduplicate(dets, s.duplicate_iou)
-                for i, d in enumerate(dets):
-                    d.det_id = i
 
-                fa = analyse_frame(dets, s, self.models.helmet_available, frame.shape[0])
-                state, agreement = signal.update(frame, dets)
-                signal_seen |= any(d.label == "traffic_light" for d in dets)
-                aggregator.update(idx, ts, frame, fa, state, agreement)
-
-                n_veh = sum(1 for d in dets if d.label in VEHICLE_LABELS)
-                per_frame_max_vehicles = max(per_frame_max_vehicles, n_veh)
-                rs = rider_summary(fa.units)
-                rider_peak["riders"] = max(rider_peak["riders"], rs["riders"])
-                timeline.append({"t": round(ts, 2), "frame": idx, "vehicles": n_veh,
-                                 "riders": rs["riders"], "candidates": len(fa.candidates), "signal": state})
-
-                annotated = viz.draw_detections(frame, dets)
-                for c in fa.candidates:
-                    rule = self.rules.get(c.rule_id)
-                    annotated = viz.draw_violation(annotated, c.region, rule.short_label if rule else c.rule_id, c.confidence)
-                if stop_line is not None:
-                    annotated = viz.draw_stop_line(annotated, stop_line * h, state)
-                annotated = viz.draw_hud(annotated, f"TRAFFICGUARD AI  |  t={ts:6.2f}s  frame {idx}")
-                video_out.write(annotated)
-
-                analysed += 1
-                idx += 1
-                if analysed % 5 == 0:
-                    progress(min(0.95, idx / max(frames_to_read, 1)), f"Analysed {analysed} frames ({ts:.1f}s)")
-        finally:
-            cap.release()
-            if video_out is not None:
-                video_out.close()
-
-        if aggregator is None or first_frame is None:
-            raise InvalidVideoError("No frames could be read from the video")
-
-        progress(0.96, "Validating violations across frames")
-        confirmed, temporal_obs = aggregator.finalize()
-
-        violations: list[dict] = []
-        observations: list[Observation] = list(temporal_obs)
-        for cv in confirmed:
-            cand = replace(cv.candidate, confidence=cv.confidence)
-            v, obs = self.rules.evaluate(cand, "video")
-            if v is None:
-                if obs is not None:
-                    observations.append(obs)
-                continue
-            v["id"] = len(violations) + 1
-            v.update({
-                "frame_index": cv.frame_index,
-                "timestamp": round(cv.timestamp, 2),
-                "first_seen": round(cv.first_frame / fps, 2),
-                "last_seen": round(cv.last_frame / fps, 2),
-                "frames_observed": cv.frames_observed,
-                "frames_evaluable": cv.frames_evaluable,
-                "temporal_consistency": round(cv.frames_observed / max(cv.frames_evaluable, 1), 3),
-            })
-            v["evidence_images"] = writer.violation_evidence(v["id"], cv.frame, cv.detections, Box(*v["region"]),
-                                                             v["title"], v["confidence"])
-            attach_plate(v, cv.frame, cv.detections, self.models, s)
-            violations.append(v)
-
-        if not self.models.helmet_available and rider_peak["riders"] > 0:
-            observations.insert(0, Observation("NO_HELMET", "Helmet checks were not performed because no helmet "
-                                                            "detection model is loaded (see models/README.md)."))
-        if stop_line is not None and not signal_seen:
-            observations.append(Observation("RED_LIGHT_JUMP", "A stop line was configured but no traffic light was "
-                                                              "detected in the footage — red-light rule not evaluated."))
-
-        unique = aggregator.unique_counts()
-        unique_vehicles = sum(v for k, v in unique.items() if k in VEHICLE_LABELS)
-        media = {
-            "processed_video": writer.url("processed.mp4"),
-            "video_browser_playable": video_out.browser_playable if video_out else False,
-            "thumbnail": writer.thumbnail(first_frame),
-            "first_frame": writer.save("first_frame.jpg", first_frame),
-        }
-        progress(1.0, "Completed")
-        return {
-            "status": "success",
-            "analysis_id": analysis_id,
-            "kind": "video",
-            "filename": filename,
-            "created_at": created_at,
-            "video": {
-                "fps": round(fps, 2), "total_frames": total, "duration": round(total / fps, 2) if total else None,
-                "analysed_frames": analysed, "frame_stride": stride, "analysed_fps": round(fps / stride, 2),
-                "width": frame_size[0], "height": frame_size[1], "truncated": truncated,
-                "max_seconds": s.video_max_seconds, "low_light_frames": low_light_frames,
-                "tracker": s.tracker.replace(".yaml", ""),
-                "stop_line": stop_line, "line_direction": line_direction if stop_line is not None else None,
-            },
-            "media": media,
-            "summary": {
-                "vehicles": unique_vehicles,
-                "unique_vehicles": unique_vehicles,
-                "unique_by_class": unique,
-                "max_vehicles_in_frame": per_frame_max_vehicles,
-                "max_riders_in_frame": rider_peak["riders"],
-                "possible_violations": len(violations),
-                "insufficient_evidence": len(observations),
-                "signal_frames": aggregator.signal_frames,
-            },
-            "violations": violations,
-            "observations": [o.to_dict() for o in observations],
-            "timeline": timeline[:: max(1, len(timeline) // 600)],
-            "confidence": max((v["confidence"] for v in violations), default=None),
-            "models": model_flags(self.models),
-            "processing_time": round(time.perf_counter() - t0, 3),
-            "disclaimer": DISCLAIMER,
-        }
+def _hud(frame: np.ndarray, idx: int, t: float, opts: VideoOptions, h: int) -> None:
+    if opts.stop_line is not None:
+        y = int(opts.stop_line * h)
+        red = (opts.red_from is None or t >= opts.red_from) and (opts.red_to is None or t <= opts.red_to)
+        cv2.line(frame, (0, y), (frame.shape[1], y), (40, 40, 255) if red else (0, 200, 0), 2, cv2.LINE_AA)
+    txt = f"f{idx}  {format_timestamp(t)}"
+    cv2.putText(frame, txt, (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, txt, (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)

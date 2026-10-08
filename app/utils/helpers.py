@@ -1,44 +1,37 @@
-"""Small helpers used across the backend."""
-
 from __future__ import annotations
 
 import re
-import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
-ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png"}
-ALLOWED_VIDEO_EXT = {".mp4", ".avi", ".mov"}
+from app.config import Settings
+
+
+def confidence_level(conf: float, s: Settings) -> str:
+    """Map a 0..1 confidence to the configurable bands: high / medium / low."""
+    if conf >= s.high_confidence:
+        return "high"
+    if conf >= s.medium_confidence:
+        return "medium"
+    return "low"
 
 
 def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def utc_now_iso() -> str:
+def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def safe_filename(name: str) -> str:
-    """Strip directories and unusual characters from an uploaded filename."""
-    base = Path(name or "upload").name
-    base = re.sub(r"[^A-Za-z0-9._ -]", "_", base).strip() or "upload"
-    return base[:120]
+def safe_filename(name: str, default: str = "upload") -> str:
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or default).strip("._") or default
+    stem, dot, ext = base.rpartition(".")
+    if not dot:
+        return base[:80]
+    return f"{stem[:80]}.{ext[:8]}"  # shorten the stem, never the extension
 
 
-def extension(name: str) -> str:
-    return Path(name or "").suffix.lower()
-
-
-class Timer:
-    def __enter__(self):
-        self.start = time.perf_counter()
-        return self
-
-    def __exit__(self, *exc):
-        self.elapsed = time.perf_counter() - self.start
-
-    @property
-    def seconds(self) -> float:
-        return round(time.perf_counter() - self.start, 3)
+def format_timestamp(seconds: float) -> str:
+    m, s = divmod(max(0.0, seconds), 60)
+    return f"{int(m):02d}:{s:05.2f}"

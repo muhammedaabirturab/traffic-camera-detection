@@ -1,3 +1,0 @@
-# Optional: AI number-plate reading (only used if models/plate.pt is also present).
-# easyocr downloads its recognition weights (~100 MB) on first use.
-easyocr>=1.7
